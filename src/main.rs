@@ -21,6 +21,8 @@ mod overlay;
 mod packs;
 mod scenery;
 mod secrets;
+#[cfg(windows)]
+mod tray;
 mod ui;
 mod variant;
 mod versions;
@@ -129,6 +131,8 @@ struct Launcher {
     java_searching: bool,
     game_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     game_running: bool,
+    #[cfg(windows)]
+    tray: tray::Tray,
     game_logs: std::collections::VecDeque<String>,
     launch_status: String,
     mod_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -295,6 +299,8 @@ impl Launcher {
             java_searching: false,
             game_cancel: None,
             game_running: false,
+            #[cfg(windows)]
+            tray: Default::default(),
             game_logs: Default::default(),
             launch_status: String::new(),
             mod_cancel: None,
@@ -613,6 +619,12 @@ impl Launcher {
             cancel: cancel.clone(),
             running: false,
         });
+        #[cfg(windows)]
+        let restore_window = if self.on_game_start() == model::OnGameStart::Minimize {
+            self.tray.window()
+        } else {
+            0
+        };
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
             let result = game::run(request, cancel, |event| {
@@ -621,6 +633,8 @@ impl Launcher {
             })
             .map_err(|e| format!("{e:#}"));
             let _ = tx.send(Event::Game(id, game::Event::Finished(result)));
+            #[cfg(windows)]
+            tray::restore(restore_window);
             ctx.request_repaint();
         });
     }
@@ -961,7 +975,13 @@ impl Launcher {
                         match self.on_game_start() {
                             model::OnGameStart::KeepOpen => {}
                             model::OnGameStart::Minimize => {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true))
+                                #[cfg(windows)]
+                                let hidden = self.tray.hide();
+                                #[cfg(not(windows))]
+                                let hidden = false;
+                                if !hidden {
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                                }
                             }
                             model::OnGameStart::Close => {
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close)
@@ -976,6 +996,13 @@ impl Launcher {
                         self.sessions.retain(|s| s.id != id);
                         self.game_cancel = self.sessions.first().map(|s| s.cancel.clone());
                         self.game_running = self.sessions.iter().any(|s| s.running);
+                        #[cfg(windows)]
+                        self.tray.remove();
+                        if self.on_game_start() == model::OnGameStart::Minimize
+                            && self.sessions.is_empty()
+                        {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                        }
                         self.launch_status.clear();
                         match result {
                             Ok(0) => self.result(Ok(()), "Игра закрыта"),
@@ -1580,7 +1607,7 @@ impl Launcher {
         use model::OnGameStart;
         let modes = [
             (OnGameStart::KeepOpen, "Оставаться открытым"),
-            (OnGameStart::Minimize, "Свернуться"),
+            (OnGameStart::Minimize, "Свернуться в трей"),
             (OnGameStart::Close, "Закрыться"),
         ];
         let mode = self.on_game_start();
@@ -3468,7 +3495,9 @@ impl Launcher {
     }
 }
 impl eframe::App for Launcher {
-    fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(windows)]
+        self.tray.bind(_frame);
         self.render(ctx);
     }
 }

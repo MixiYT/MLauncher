@@ -1956,6 +1956,7 @@ dependencies = [
  "image",
  "md-5",
  "open",
+ "raw-window-handle",
  "regex",
  "reqwest",
  "rfd",
