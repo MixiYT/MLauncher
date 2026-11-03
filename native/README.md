@@ -7,7 +7,7 @@ Optional x64 Windows DLL for **our own launched Java child only**. This is an Op
 - Logs: bounded, redacted tail of this session's log. No remote reporting.
 - Closing releases input to Minecraft. Alt+Tab hides it. No keyboard/process hooks are installed globally.
 - The overlay uses the launcher's accent, light/dark underlay and simple effect (waves/bubbles/aurora). It is not an always-on-top window.
-- Windows x64, WGL, OpenGL 3+. Window class names are not required, so wrappers used by NeoForge/GLFW are accepted. **Vulkan / VulkanMod, EGL/ANGLE and DirectX are not supported.** Context recreation mods and other overlays can conflict. No claim of all-loader/game-version compatibility.
+- Windows x64, WGL, OpenGL 3+. Window class names are not required, so wrappers used by NeoForge/GLFW are accepted. **Vulkan / VulkanMod, EGL/ANGLE and DirectX are not supported.** Hidden bootstrap windows are ignored. WGL context deletion releases the old renderer, and a replacement context initializes a fresh renderer. Other overlays and unusual context/thread ownership can still conflict. No claim of all-loader/game-version compatibility.
 - Anticheats and security software may block or flag DLL injection. We do not bypass protections. Disable the setting and restart the client if it conflicts.
 
 The launcher binds a random port on `127.0.0.1` with a separate random per-session token. That token is passed through the child environment, not command-line arguments. The bridge rejects browser Origin headers, requires the token and exact loopback Host, limits headers/bodies and concurrent connections, and never accepts arbitrary download URLs or target paths. Download IDs must first come from its own resource search. The selected instance is fixed for the lifetime of the bridge. Hiding the overlay stops polling; downloads already requested may finish. The launcher must remain open.
@@ -35,6 +35,6 @@ $env:MLAUNCHER_OVERLAY_SCREENSHOT = "$env:LOCALAPPDATA\Temp\opencode\native-over
 cargo run -- --overlay-smoke-test
 ```
 
-This creates **a new test OpenGL process**, injects the real DLL, checks native rendering initialization and Shift+Tab closing/reopening/repeat handling, and saves the framebuffer. It never attaches to an existing game or edits the user's launcher configuration. Passing it is **not** a full Minecraft/anticheat/fullscreen compatibility test.
+This creates **a new test OpenGL process**, injects the real DLL, checks native rendering initialization, hidden bootstrap contexts, context recreation, process teardown, and Shift+Tab closing/reopening/repeat handling, and saves the framebuffer. It never attaches to an existing game or edits the user's launcher configuration. Passing it is **not** a full Minecraft/anticheat/fullscreen compatibility test.
 
 For the optional network-dependent catalog/download check, also set `$env:MLAUNCHER_OVERLAY_TEST_QUERY = 'Default Dark Mode'` before running. The native WinHTTP client will search real Modrinth cards; the Rust test then downloads a compatible resourcepack twice into its temporary instance and checks the registry. No user game files are touched. The test also checks that open-overlay keyboard/mouse messages do not reach the host, and that closing restores them.

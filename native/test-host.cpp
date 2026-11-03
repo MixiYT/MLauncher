@@ -31,11 +31,12 @@ static void screenshot(const wchar_t* path,int w,int h){
 int main(){
     int argc=0;wchar_t** argv=CommandLineToArgvW(GetCommandLineW(),&argc);
     WNDCLASSW klass{};klass.style=CS_OWNDC;klass.lpfnWndProc=windowProc;klass.hInstance=GetModuleHandleW(nullptr);klass.lpszClassName=L"GLFW30";RegisterClassW(&klass);
-    HWND window=CreateWindowW(L"GLFW30",L"MLauncher OpenGL overlay smoke host",WS_OVERLAPPEDWINDOW|WS_VISIBLE,100,100,1100,760,nullptr,nullptr,klass.hInstance,nullptr);
+    HWND window=CreateWindowW(L"GLFW30",L"MLauncher OpenGL overlay smoke host",WS_OVERLAPPEDWINDOW,100,100,1100,760,nullptr,nullptr,klass.hInstance,nullptr);
     HDC dc=GetDC(window);PIXELFORMATDESCRIPTOR format{};format.nSize=sizeof(format);format.nVersion=1;format.dwFlags=PFD_DRAW_TO_WINDOW|PFD_SUPPORT_OPENGL|PFD_DOUBLEBUFFER;format.iPixelType=PFD_TYPE_RGBA;format.cColorBits=32;
     int pixelFormat=ChoosePixelFormat(dc,&format);SetPixelFormat(dc,pixelFormat,&format);HGLRC context=wglCreateContext(dc);wglMakeCurrent(dc,context);
     printf("OpenGL smoke host: %s\n",glGetString(GL_VERSION));fflush(stdout);
     const ULONGLONG start=GetTickCount64();ULONGLONG ready=0;bool closed=false,reopened=false,repeatTest=false,escapeTest=false,captured=false,inputCaptured=false,inputRestored=false;int result=1;
+    bool shown=false,recreated=false,recreationOK=false,hiddenIgnored=true;
     const bool needsSearch=GetEnvironmentVariableW(L"MLAUNCHER_OVERLAY_TEST_QUERY",nullptr,0)>0;
     for(;;){
         MSG message;while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){if(message.message==WM_QUIT)return result;TranslateMessage(&message);DispatchMessageW(&message);}
@@ -43,6 +44,8 @@ int main(){
         const auto total=GetTickCount64()-start;
         HMODULE overlay=GetModuleHandleW(L"mlauncher-overlay.dll");Status status=overlay?reinterpret_cast<Status>(GetProcAddress(overlay,"MLauncherOverlayStatus")):nullptr;
         Status count=overlay?reinterpret_cast<Status>(GetProcAddress(overlay,"MLauncherOverlayResourceCount")):nullptr;
+        if(!shown&&total<700&&status&&status()!=0)hiddenIgnored=false;
+        if(!shown&&total>=700){ShowWindow(window,SW_SHOW);SetForegroundWindow(window);shown=true;}
         if(!ready&&status&&status()==3&&(!needsSearch||(count&&count()>0))){
             ready=GetTickCount64();const auto keys=gameKeys,mouse=gameMouse;
             SendMessageW(window,WM_KEYDOWN,VK_F12,0);SendMessageW(window,WM_KEYUP,VK_F12,0);SendMessageW(window,WM_MOUSEMOVE,0,MAKELPARAM(100,100));
@@ -60,10 +63,18 @@ int main(){
             SendMessageW(window,WM_KEYDOWN,VK_ESCAPE,0);const bool escaped=status()==1;toggle(window);
             escapeTest=escaped&&status()==3;printf("Escape closes and Shift+Tab reopens: %s\n",escapeTest?"OK":"FAIL");
         }
-        if(elapsed>2200&&!captured&&reopened&&repeatTest&&escapeTest&&inputCaptured&&inputRestored&&status&&status()==3){if(argc>1)screenshot(argv[1],r.right,r.bottom);captured=true;result=0;}
+        if(elapsed>1800&&!recreated){
+            wglMakeCurrent(nullptr,nullptr);wglDeleteContext(context);context=wglCreateContext(dc);wglMakeCurrent(dc,context);
+            recreated=true;
+        }else if(recreated&&status&&status()==3)recreationOK=true;
+        if(elapsed>2200&&hiddenIgnored&&recreationOK&&!captured&&reopened&&repeatTest&&escapeTest&&inputCaptured&&inputRestored&&status&&status()==3){if(argc>1)screenshot(argv[1],r.right,r.bottom);captured=true;result=0;}
         if(elapsed>3000||total>25000)break;Sleep(16);
     }
+    printf("Hidden bootstrap context ignored: %s\n",hiddenIgnored?"OK":"FAIL");
+    printf("Context recreation restores rendering: %s\n",recreationOK?"OK":"FAIL");
     printf("Native injected rendering + hotkeys: %s\n",result==0?"OK":"FAIL");fflush(stdout);
-    // Process teardown restores all native resources; don't unload a live hooked DLL.
+    wglMakeCurrent(nullptr,nullptr);wglDeleteContext(context);
+    ReleaseDC(window,dc);DestroyWindow(window);
+    // The DLL stays loaded for the child process lifetime.
     return result;
 }

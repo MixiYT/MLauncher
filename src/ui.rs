@@ -5,11 +5,10 @@ pub enum Icon {
     User,
     Folder,
     Refresh,
-    Menu,
+    Settings,
     Mods,
     Plus,
     Back,
-    Next,
     Home,
     Trash,
     Search,
@@ -53,6 +52,49 @@ pub fn icon_button_size(ui: &mut egui::Ui, icon: Icon, tooltip: &str, size: Vec2
         visuals.fg_stroke.color,
     );
     response.on_hover_text(tooltip)
+}
+
+/// Shared fixed-height status row for all scrolling catalogs.
+pub fn catalog_footer(
+    ui: &mut egui::Ui,
+    count: usize,
+    loading: bool,
+    failed: bool,
+) -> egui::InnerResponse<bool> {
+    ui.horizontal(|ui| {
+        ui.set_min_height(32.);
+        ui.label(format!("Загружено: {count}"));
+        if loading {
+            ui.spinner();
+        }
+        failed && ui.button("Повторить загрузку").clicked()
+    })
+}
+
+pub fn catalog_thumbnail(
+    ui: &mut egui::Ui,
+    texture: Option<&egui::TextureHandle>,
+    icon: Icon,
+    size: f32,
+) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    ui.painter()
+        .rect_filled(rect, 5., ui.visuals().selection.bg_fill);
+    if let Some(texture) = texture {
+        let dimensions = texture.size_vec2();
+        let image_rect = Rect::from_center_size(
+            rect.center(),
+            dimensions * (size / dimensions.x.max(dimensions.y).max(1.)),
+        );
+        ui.painter().image(
+            texture.id(),
+            image_rect,
+            Rect::from_min_max(Pos2::ZERO, egui::pos2(1., 1.)),
+            Color32::WHITE,
+        );
+    } else {
+        paint_icon(ui, icon, rect.shrink(size * 0.2), ui.visuals().text_color());
+    }
 }
 
 pub fn provider_button(ui: &mut egui::Ui, icon: Icon, text: &str) -> Response {
@@ -144,12 +186,24 @@ pub fn paint_icon(ui: &egui::Ui, icon: Icon, rect: Rect, color: Color32) {
             }
         }
         Icon::Resources => {
-            outline(0.08, 0.12, 0.84, 0.76);
-            p.circle_stroke(at(0.7, 0.32), rect.width() * 0.09, s);
-            line((0.12, 0.75), (0.4, 0.42));
-            line((0.4, 0.42), (0.64, 0.75));
-            line((0.64, 0.75), (0.78, 0.6));
-            line((0.78, 0.6), (0.9, 0.75));
+            // A texture tile, using the same stroke as the other navigation icons.
+            outline(0.12, 0.12, 0.76, 0.76);
+            for (x, y) in [
+                (0.18, 0.18),
+                (0.5, 0.18),
+                (0.34, 0.34),
+                (0.66, 0.34),
+                (0.18, 0.5),
+                (0.5, 0.5),
+                (0.34, 0.66),
+                (0.66, 0.66),
+            ] {
+                p.rect_filled(
+                    Rect::from_min_max(at(x, y), at(x + 0.16, y + 0.16)),
+                    0.,
+                    color,
+                );
+            }
         }
         Icon::Exchange => {
             line((0.12, 0.3), (0.86, 0.3));
@@ -228,18 +282,18 @@ pub fn paint_icon(ui: &egui::Ui, icon: Icon, rect: Rect, color: Color32) {
             );
         }
         Icon::Folder => {
-            p.add(egui::Shape::convex_polygon(
+            p.add(egui::Shape::closed_line(
                 vec![
                     at(0.08, 0.25),
-                    at(0.4, 0.25),
-                    at(0.52, 0.37),
+                    at(0.38, 0.25),
+                    at(0.5, 0.37),
                     at(0.92, 0.37),
-                    at(0.82, 0.84),
-                    at(0.08, 0.84),
+                    at(0.92, 0.85),
+                    at(0.08, 0.85),
                 ],
-                color,
-                Stroke::NONE,
+                s,
             ));
+            line((0.12, 0.47), (0.88, 0.47));
         }
         Icon::Plus => {
             line((0.5, 0.12), (0.5, 0.88));
@@ -250,26 +304,47 @@ pub fn paint_icon(ui: &egui::Ui, icon: Icon, rect: Rect, color: Color32) {
             line((0.2, 0.5), (0.5, 0.2));
             line((0.2, 0.5), (0.5, 0.8));
         }
-        Icon::Next => {
-            line((0.2, 0.5), (0.8, 0.5));
-            line((0.8, 0.5), (0.5, 0.2));
-            line((0.8, 0.5), (0.5, 0.8));
-        }
         Icon::Home => {
             line((0.1, 0.48), (0.5, 0.12));
             line((0.5, 0.12), (0.9, 0.48));
             outline(0.24, 0.45, 0.52, 0.43);
             outline(0.44, 0.65, 0.15, 0.23);
         }
-        Icon::Menu => {
-            for y in [0.22, 0.5, 0.78] {
-                line((0.12, y), (0.88, y));
-            }
+        Icon::Settings => {
+            let points = (0..64)
+                .map(|i| {
+                    let angle = i as f32 * std::f32::consts::TAU / 64.;
+                    let radius = if i % 8 < 4 { 0.44 } else { 0.34 };
+                    at(0.5 + angle.cos() * radius, 0.5 + angle.sin() * radius)
+                })
+                .collect();
+            p.add(egui::Shape::closed_line(points, s));
+            p.circle_stroke(rect.center(), rect.width() * 0.14, s);
         }
         Icon::Mods => {
-            for (x, y) in [(0.12, 0.12), (0.56, 0.12), (0.12, 0.56), (0.56, 0.56)] {
-                outline(x, y, 0.32, 0.32);
-            }
+            // Plug-in puzzle piece.
+            p.add(egui::Shape::line(
+                vec![
+                    at(0.1, 0.35),
+                    at(0.36, 0.35),
+                    at(0.36, 0.22),
+                    at(0.42, 0.12),
+                    at(0.56, 0.12),
+                    at(0.64, 0.22),
+                    at(0.64, 0.35),
+                    at(0.88, 0.35),
+                    at(0.88, 0.6),
+                    at(0.75, 0.6),
+                    at(0.67, 0.67),
+                    at(0.67, 0.77),
+                    at(0.75, 0.84),
+                    at(0.88, 0.84),
+                    at(0.88, 0.92),
+                    at(0.1, 0.92),
+                    at(0.1, 0.35),
+                ],
+                s,
+            ));
         }
         Icon::Search => {
             p.circle_stroke(at(0.42, 0.42), rect.width() * 0.28, s);

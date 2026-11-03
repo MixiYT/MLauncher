@@ -1,0 +1,8 @@
+/target/
+*.log
+.env
+/native/downloads/
+/native/vendor/
+/native/bin/
+/native/objects/
+/dist/

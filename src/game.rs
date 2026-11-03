@@ -1206,6 +1206,9 @@ pub fn run(
     if let (Some(options), Some(bridge)) = (&request.overlay, &bridge) {
         let message=match crate::overlay::inject(&child,&options.dll){Ok(())=>"[Оверлей] DLL подключена. Shift+Tab после загрузки OpenGL. Vulkan не поддерживается.".into(),Err(e)=>format!("[Оверлей] Отключён для этой сессии: {e:#}")};
         bridge.log(&message);
+        if let Ok(mut log) = log.lock() {
+            let _ = writeln!(log, "{message}");
+        }
         events(Event::Log(message));
     }
     events(Event::Started);
@@ -1242,7 +1245,11 @@ pub fn run(
     let status = loop {
         if let Some(bridge) = &bridge {
             if let Some(message) = bridge.take_status() {
-                events(Event::Log(format!("[Оверлей] {message}")));
+                let line = format!("[Оверлей] {message}");
+                if let Ok(mut log) = log.lock() {
+                    let _ = writeln!(log, "{line}");
+                }
+                events(Event::Log(line));
             }
         }
         for line in rx.try_iter().take(100) {
@@ -1295,6 +1302,7 @@ pub fn loader_smoke_test() -> Result<()> {
         let request = Request {
             overlay: None,
             profile: crate::model::Profile {
+                java: None,
                 name: loader.into(),
                 game_version: mc.into(),
                 loader: loader.into(),

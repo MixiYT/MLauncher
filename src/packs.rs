@@ -322,6 +322,44 @@ impl Service {
         mc: &str,
         sort: SortOrder,
     ) -> Result<Vec<Entry>> {
+        self.search_page(provider, query, resources, mc, sort, 0)
+    }
+    pub fn search_page(
+        &self,
+        provider: Provider,
+        query: &str,
+        resources: bool,
+        mc: &str,
+        sort: SortOrder,
+        offset: usize,
+    ) -> Result<Vec<Entry>> {
+        self.search_catalog(provider, query, resources, false, mc, sort, offset)
+    }
+
+    pub fn search_maps(
+        &self,
+        query: &str,
+        mc: &str,
+        sort: SortOrder,
+        offset: usize,
+    ) -> Result<Vec<Entry>> {
+        self.search_catalog(Provider::CurseForge, query, false, true, mc, sort, offset)
+    }
+
+    fn search_catalog(
+        &self,
+        provider: Provider,
+        query: &str,
+        resources: bool,
+        maps: bool,
+        mc: &str,
+        sort: SortOrder,
+        offset: usize,
+    ) -> Result<Vec<Entry>> {
+        // The other providers expose bounded catalogs rather than cursor searches.
+        if offset > 0 && !matches!(provider, Provider::Modrinth | Provider::CurseForge) {
+            return Ok(vec![]);
+        }
         let mut entries = vec![];
         match provider {
             Provider::Modrinth => {
@@ -329,7 +367,7 @@ impl Service {
                     "project_type:{}",
                     if resources { "resourcepack" } else { "modpack" }
                 )]];
-                if resources {
+                if resources && query.is_empty() {
                     facets.push(vec![format!("versions:{mc}")]);
                 }
                 let v = self.get(
@@ -337,6 +375,7 @@ impl Service {
                     &[
                         ("query", query.into()),
                         ("limit", "20".into()),
+                        ("offset", offset.to_string()),
                         ("index", sort.modrinth().into()),
                         ("facets", json!(facets).to_string()),
                     ],
@@ -363,13 +402,24 @@ impl Service {
             Provider::CurseForge => {
                 let mut params = vec![
                     ("gameId", "432".into()),
-                    ("classId", if resources { "12" } else { "4471" }.into()),
+                    (
+                        "classId",
+                        if maps {
+                            "17"
+                        } else if resources {
+                            "12"
+                        } else {
+                            "4471"
+                        }
+                        .into(),
+                    ),
                     ("searchFilter", query.into()),
                     ("pageSize", "20".into()),
+                    ("index", offset.to_string()),
                     ("sortField", sort.curseforge().into()),
                     ("sortOrder", "desc".into()),
                 ];
-                if resources {
+                if maps || resources && query.is_empty() {
                     params.push(("gameVersion", mc.into()));
                 }
                 let v = self.get("https://api.curseforge.com/v1/mods/search", &params)?;
@@ -782,6 +832,46 @@ impl Service {
         file.persist_noclobber(path)?;
         Ok(())
     }
+    pub fn download_map(
+        &self,
+        entry: &Entry,
+        mc: &str,
+        instance: &Path,
+        cancel: &AtomicBool,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            entry.provider == Provider::CurseForge,
+            "Карты доступны в CurseForge"
+        );
+        segment(&entry.id)?;
+        let saves = instance.join("saves");
+        fs::create_dir_all(&saves)?;
+        anyhow::ensure!(
+            saves.canonicalize()?.parent() == Some(instance.canonicalize()?.as_path()),
+            "Папка миров находится вне сборки"
+        );
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(saves.join(".mlauncher-maps.lock"))?;
+        fs2::FileExt::try_lock_exclusive(&lock).context("Уже скачивается другая карта")?;
+        let destination = map_path(instance, entry);
+        anyhow::ensure!(!destination.exists(), "Карта уже есть в папке миров");
+        let versions = self.versions(entry, true, mc)?;
+        let version = versions.first().context("Нет совместимой версии карты")?;
+        let spec = self.cf_file(&entry.id, &version.id)?;
+        anyhow::ensure!(
+            spec.path.to_ascii_lowercase().ends_with(".zip"),
+            "Поддерживаются карты в ZIP"
+        );
+        let staged = tempfile::tempdir_in(&saves)?;
+        let archive = staged.path().join("map.zip");
+        self.fetch(&spec, &archive, cancel, false)?;
+        install_map_archive(&archive, staged.path(), &destination, cancel)
+    }
+
     pub fn resource(
         &self,
         e: &Entry,
@@ -1479,12 +1569,53 @@ fn finish(m: Manifest, staged: &Path, instances: &Path, cancel: &AtomicBool) -> 
     anyhow::ensure!(!target.exists(), "Папка сборки уже существует");
     fs::rename(staged, &target)?;
     Ok(Profile {
+        java: None,
         name: m.name,
         game_version: m.minecraft,
         loader: m.loader,
         directory,
     })
 }
+pub fn map_path(instance: &Path, entry: &Entry) -> PathBuf {
+    let name = model::directory_from_name(&entry.name);
+    instance.join("saves").join(format!(
+        "{name} [CF-{}]",
+        model::directory_from_name(&entry.id)
+    ))
+}
+
+fn install_map_archive(
+    archive: &Path,
+    stage: &Path,
+    destination: &Path,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let extracted = stage.join("world");
+    fs::create_dir(&extracted)?;
+    extract_game_zip(archive, &extracted, cancel)?;
+    let mut pending = vec![extracted];
+    let mut world = None;
+    while let Some(dir) = pending.pop() {
+        downloads::check_cancel(cancel)?;
+        if dir.join("level.dat").is_file() {
+            anyhow::ensure!(world.is_none(), "В архиве несколько миров");
+            world = Some(dir);
+        } else {
+            for entry in fs::read_dir(dir)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() && entry.file_name() != "__MACOSX" {
+                    pending.push(entry.path());
+                }
+            }
+        }
+    }
+    let world = world.context("В архиве нет мира Minecraft (level.dat)")?;
+    downloads::check_cancel(cancel)?;
+    anyhow::ensure!(!destination.exists(), "Карта уже есть в папке миров");
+    fs::rename(world, destination)?;
+    Ok(())
+}
+
 fn extract_game_zip(archive: &Path, destination: &Path, cancel: &AtomicBool) -> Result<()> {
     let mut zip = zip::ZipArchive::new(File::open(archive)?)?;
     let mut total = 0u64;
@@ -1774,6 +1905,110 @@ pub fn smoke_test() -> Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn map_archive_installs_nested_world_without_overwrite() {
+        let root = tempfile::tempdir().unwrap();
+        let zip_path = root.path().join("map.zip");
+        let mut zip = zip::ZipWriter::new(File::create(&zip_path).unwrap());
+        for (name, data) in [
+            ("package/world/level.dat", b"world".as_slice()),
+            ("package/world/region/r.0.0.mca", b"region".as_slice()),
+        ] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(data).unwrap();
+        }
+        zip.finish().unwrap();
+        let destination = root.path().join("installed");
+        let stage = tempfile::tempdir_in(root.path()).unwrap();
+        install_map_archive(
+            &zip_path,
+            stage.path(),
+            &destination,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(fs::read(destination.join("level.dat")).unwrap(), b"world");
+        assert!(destination.join("region/r.0.0.mca").is_file());
+        let stage = tempfile::tempdir_in(root.path()).unwrap();
+        assert!(install_map_archive(
+            &zip_path,
+            stage.path(),
+            &destination,
+            &AtomicBool::new(false)
+        )
+        .is_err());
+        assert_eq!(fs::read(destination.join("level.dat")).unwrap(), b"world");
+    }
+
+    #[test]
+    #[ignore = "Downloads a small world from CurseForge using the configured key"]
+    fn live_map_download() {
+        let root = directories::ProjectDirs::from("dev", "MLauncher", "MLauncher").unwrap();
+        let (_, stored) = crate::secrets::load_api_keys(root.data_local_dir());
+        let key = std::env::var("CURSEFORGE_API_KEY")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or(stored);
+        assert!(!key.trim().is_empty(), "CurseForge API key required");
+        let service = Service::new(key.clone()).unwrap();
+        let mc = "1.21.1";
+        let maps = service
+            .search_maps("skyblock", mc, SortOrder::Relevance, 0)
+            .unwrap();
+        assert!(!maps.is_empty());
+        let instance = tempfile::tempdir().unwrap();
+        let profile = crate::model::Config::default().profiles.remove(0);
+        let bridge =
+            crate::overlay::Bridge::start(&profile, instance.path().to_owned(), key).unwrap();
+        let client = reqwest::blocking::Client::new();
+        let request = |route: &str, body: Value| -> Value {
+            client
+                .post(format!("http://127.0.0.1:{}{route}", bridge.port))
+                .header("X-MLauncher-Token", bridge.secret())
+                .json(&body)
+                .send()
+                .unwrap()
+                .json()
+                .unwrap()
+        };
+        let catalog = request(
+            "/maps",
+            json!({"provider":"curseforge","query":"skyblock","sort":"relevance"}),
+        );
+        assert!(
+            catalog["entries"]
+                .as_array()
+                .is_some_and(|rows| !rows.is_empty()),
+            "{catalog}"
+        );
+        for entry in maps {
+            let versions = service.versions(&entry, true, mc).unwrap();
+            let Some(version) = versions.first() else {
+                continue;
+            };
+            let Ok(spec) = service.cf_file(&entry.id, &version.id) else {
+                continue;
+            };
+            if !spec.path.to_ascii_lowercase().ends_with(".zip")
+                || !spec.size.is_some_and(|size| size <= 8 * 1024 * 1024)
+            {
+                continue;
+            }
+            let result = request(
+                "/download-map",
+                json!({"provider":"curseforge", "id":entry.id}),
+            );
+            assert!(result["message"].is_string(), "{result}");
+            assert!(map_path(instance.path(), &entry)
+                .join("level.dat")
+                .is_file());
+            println!("Installed and verified world: {}", entry.name);
+            return;
+        }
+        panic!("No compatible downloadable small ZIP world found");
+    }
+
+    #[test]
     fn overlay_and_launcher_cannot_race_resource_manifests() {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir_all(root.path().join("launcher")).unwrap();
@@ -1889,6 +2124,7 @@ mod tests {
         )
         .unwrap();
         let p = Profile {
+            java: None,
             name: "Test".into(),
             game_version: "1.20.1".into(),
             loader: "fabric".into(),
@@ -1970,6 +2206,7 @@ mod tests {
         fs::write(instance.join("config/a.toml"), b"test=true").unwrap();
         fs::write(instance.join("sessions.dat"), b"secret").unwrap();
         let p = Profile {
+            java: None,
             name: "Test".into(),
             game_version: "1.20.1".into(),
             loader: "fabric".into(),

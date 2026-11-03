@@ -5,7 +5,7 @@ use crate::{
     packs::{Entry, Provider, Service, Version},
     ui::{self, Icon},
 };
-use eframe::egui::{self, Vec2};
+use eframe::egui;
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -19,10 +19,11 @@ pub enum Section {
     #[default]
     Packs,
     Resources,
+    Maps,
     Exchange,
 }
 enum Message {
-    Found(String, anyhow::Result<Vec<Entry>>),
+    Found(u64, usize, String, anyhow::Result<(String, Vec<Entry>)>),
     Versions(Entry, anyhow::Result<Vec<Version>>),
     Progress(String),
     Done(anyhow::Result<Option<Profile>>),
@@ -39,6 +40,7 @@ pub struct Content {
     installed_resources: Vec<crate::packs::ResourceRecord>,
     refresh_resources: bool,
     entries: Vec<Entry>,
+    browse: crate::browse::Browse,
     selected: Option<Entry>,
     versions: Vec<Version>,
     version: usize,
@@ -81,7 +83,19 @@ impl Content {
             self.entries.iter().map(|e| e.icon_url.clone()).collect(),
             ctx,
         );
+        self.browse
+            .sync(self.signature(config), ctx.input(|i| i.time), false);
         self.search(ctx, config, key);
+    }
+    fn signature(&self, config: &Config) -> String {
+        format!(
+            "{:?}|{}|{}|{}|{}",
+            self.provider,
+            self.section == Section::Resources,
+            self.query.trim(),
+            self.sort.modrinth(),
+            config.profiles[config.selected].game_version
+        )
     }
     fn cache_file(&self) -> PathBuf {
         self.cache_root.join(format!(
@@ -104,11 +118,15 @@ impl Content {
             return;
         }
         self.section = section;
+        self.browse.invalidate();
         self.entries.clear();
         self.selected = None;
         self.versions.clear();
         self.status.clear();
         self.confirm = false;
+        if section == Section::Maps {
+            self.provider = Provider::CurseForge;
+        }
         if section == Section::Resources
             && !matches!(self.provider, Provider::Modrinth | Provider::CurseForge)
         {
@@ -121,18 +139,39 @@ impl Content {
         if let Some(rx) = &self.rx {
             while let Ok(message) = rx.try_recv() {
                 match message {
-                    Message::Found(mc, result) => {
+                    Message::Found(revision, offset, mc, result) => {
+                        if !self.browse.finish(
+                            revision,
+                            offset,
+                            result.as_ref().ok().map(|(_, entries)| entries.len()),
+                        ) {
+                            continue;
+                        }
                         self.busy = false;
-                        if self.section == Section::Resources && mc != self.mc {
+                        if matches!(self.section, Section::Resources | Section::Maps)
+                            && mc != self.mc
+                        {
                             continue;
                         }
                         match result {
-                            Ok(entries) => {
+                            Ok((query, entries)) => {
+                                self.browse.resolved_query = Some(query);
                                 self.thumbnails.request(
                                     entries.iter().map(|e| e.icon_url.clone()).collect(),
                                     ctx,
                                 );
-                                self.entries = entries;
+                                if offset == 0 {
+                                    self.entries.clear();
+                                }
+                                for entry in entries {
+                                    if !self
+                                        .entries
+                                        .iter()
+                                        .any(|e| e.provider == entry.provider && e.id == entry.id)
+                                    {
+                                        self.entries.push(entry);
+                                    }
+                                }
                                 self.status.clear();
                                 self.error = false;
                             }
@@ -293,41 +332,28 @@ impl Content {
         self.status(ui);
     }
     fn avatar(&self, ui: &mut egui::Ui, entry: &Entry, size: f32) {
-        if let Some(texture) = self.thumbnails.get(&entry.icon_url) {
-            let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::hover());
-            ui.painter()
-                .rect_filled(rect, 5., ui.visuals().selection.bg_fill);
-            let dimensions = texture.size_vec2();
-            let image_rect = egui::Rect::from_center_size(
-                rect.center(),
-                dimensions * (size / dimensions.x.max(dimensions.y).max(1.)),
-            );
-            ui.painter().image(
-                texture.id(),
-                image_rect,
-                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1., 1.)),
-                egui::Color32::WHITE,
-            );
-        } else {
-            let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::hover());
-            ui.painter()
-                .rect_filled(rect, 5., ui.visuals().selection.bg_fill);
-            ui::paint_icon(
-                ui,
-                if self.section == Section::Resources {
-                    Icon::Resources
-                } else {
-                    Icon::Builds
-                },
-                rect.shrink(size * 0.2),
-                ui.visuals().text_color(),
-            );
-        }
+        ui::catalog_thumbnail(
+            ui,
+            self.thumbnails.get(&entry.icon_url),
+            if self.section == Section::Resources {
+                Icon::Resources
+            } else {
+                Icon::Builds
+            },
+            size,
+        );
     }
     fn search(&mut self, ctx: &egui::Context, config: &Config, key: &str) {
+        if self.mutation_busy() {
+            return;
+        }
+        let Some((revision, offset)) = self.browse.begin() else {
+            return;
+        };
         self.refresh_resources = true;
         let cache = self.cache_file();
-        let cacheable = self.query.trim().is_empty() && !self.cache_root.as_os_str().is_empty();
+        let cacheable =
+            offset == 0 && self.query.trim().is_empty() && !self.cache_root.as_os_str().is_empty();
         let (provider, query, resources, mc, key, sort) = (
             self.provider,
             self.query.clone(),
@@ -336,12 +362,23 @@ impl Content {
             key.to_owned(),
             self.sort,
         );
-        self.selected = None;
+        if offset == 0 {
+            self.selected = None;
+        }
+        let resolved = self.browse.resolved_query.clone();
+        let maps = self.section == Section::Maps;
         self.start(ctx, false, move |tx, _, _| {
-            let result = Service::new(key)
-                .and_then(|s| s.search_sorted(provider, &query, resources, &mc, sort));
-            if cacheable {
-                if let Ok(entries) = &result {
+            let result = Service::new(key).and_then(|s| {
+                crate::browse::search_variants(&query, resolved, |q| {
+                    if maps {
+                        s.search_maps(q, &mc, sort, offset)
+                    } else {
+                        s.search_page(provider, q, resources, &mc, sort, offset)
+                    }
+                })
+            });
+            if cacheable && !maps {
+                if let Ok((_, entries)) = &result {
                     if let Ok(bytes) =
                         serde_json::to_vec(&entries.iter().take(20).collect::<Vec<_>>())
                     {
@@ -351,7 +388,7 @@ impl Content {
                     }
                 }
             }
-            let _ = tx.send(Message::Found(mc, result));
+            let _ = tx.send(Message::Found(revision, offset, mc, result));
         });
     }
     fn catalog(
@@ -364,13 +401,14 @@ impl Content {
         blocked: bool,
     ) {
         let resources = self.section == Section::Resources;
+        let maps = self.section == Section::Maps;
         let instance = config.instance_dir(root);
         if resources && (self.refresh_resources || self.installed_instance != instance) {
             self.installed_resources = crate::packs::resources(&instance);
-            self.installed_instance = instance;
+            self.installed_instance = instance.clone();
             self.refresh_resources = false;
         }
-        if resources {
+        if resources || maps {
             let mc = config.profiles[config.selected].game_version.clone();
             if self.mc != mc {
                 self.mc = mc;
@@ -380,11 +418,12 @@ impl Content {
                 self.status.clear();
             }
         }
-        ui.add_enabled_ui(!self.busy,|ui|{
+        let mut search_now = false;
+        ui.add_enabled_ui(!self.mutation_busy(),|ui|{
             ui.horizontal(|ui|{
                 egui::ComboBox::from_id_salt("content_provider").width(120.).selected_text(self.provider.label()).show_ui(ui,|ui|{
                     for p in Provider::ALL {
-                        if resources&&!matches!(p,Provider::Modrinth|Provider::CurseForge){continue;}
+                        if maps && p != Provider::CurseForge || resources&&!matches!(p,Provider::Modrinth|Provider::CurseForge){continue;}
                         if ui.selectable_value(&mut self.provider,p,p.label()).changed(){self.entries.clear();self.selected=None;self.status.clear();if !p.supports_sort(self.sort){self.sort=SortOrder::Relevance;}}
                     }
                 });
@@ -398,10 +437,11 @@ impl Content {
                 });
                 if !matches!(self.provider,Provider::Modrinth|Provider::CurseForge){ui::icon_button(ui,Icon::Info,"Сортировка среди найденных результатов. Недоступные режимы не поддерживаются API этого каталога.");}
             });
-            if old_sort!=self.sort {self.search(ctx,config,key);}
+            if old_sort!=self.sort {search_now=true;}
             ui.horizontal(|ui|{
-                let response=ui.add_sized([(ui.available_width()-48.).max(64.),32.],egui::TextEdit::singleline(&mut self.query).hint_text(if resources{"Найти ресурспак"}else{"Найти сборку"}));
-                if ui::icon_button(ui,Icon::Search,"Найти").clicked()||(response.lost_focus()&&ui.input(|i|i.key_pressed(egui::Key::Enter))){self.search(ctx,config,key);}
+                let response=ui.add_sized([(ui.available_width()-48.).max(64.),32.],egui::TextEdit::singleline(&mut self.query).hint_text(if maps {"Найти карту"} else if resources{"Найти ресурспак"}else{"Найти сборку"}));
+                if response.changed(){ctx.request_repaint_after(std::time::Duration::from_millis(360));}
+                if ui::icon_button(ui,Icon::Search,"Найти").clicked()||(response.lost_focus()&&ui.input(|i|i.key_pressed(egui::Key::Enter))){search_now=true;}
             });
             if let Some(entry)=self.selected.clone(){
                 ui.group(|ui|{
@@ -414,7 +454,7 @@ impl Content {
                     egui::ComboBox::from_id_salt("pack_version").width(ui.available_width()).truncate().selected_text(&self.versions[self.version].name).show_ui(ui,|ui|{for(i,v)in self.versions.iter().enumerate(){ui.selectable_value(&mut self.version,i,&v.name);}});
                     ui.horizontal(|ui|{
                         if !resources {ui.checkbox(&mut self.confirm,"Доверяю источнику").on_hover_text("Сборка содержит исполняемые Java-моды. Продолжайте только для доверенного источника.");}
-                        if ui.add_enabled_ui((resources||self.confirm)&&!blocked,|ui|ui::icon_button(ui,Icon::Download,if resources{"Скачать ресурспак"}else{"Установить отдельной сборкой"})).inner.clicked(){
+                        if ui.add_enabled_ui((resources||self.confirm)&&!blocked&&!self.busy,|ui|ui::icon_button(ui,Icon::Download,if resources{"Скачать ресурспак"}else{"Установить отдельной сборкой"})).inner.clicked(){
                             let(version,instances,instance,key)=(self.versions[self.version].id.clone(),config.game_root(root).join("instances"),config.instance_dir(root),key.to_owned());
                             self.start(ctx,true,move|tx,cancel,ctx|{let result=Service::new(key).and_then(|s|if resources{s.resource(&entry,&version,&instance,&cancel).map(|_|None)}else{s.install(&entry,&version,&instances,&cancel,&|p|{let _=tx.send(Message::Progress(p));ctx.request_repaint();}).map(Some)});let _=tx.send(Message::Done(result));});
                         }
@@ -422,19 +462,45 @@ impl Content {
                 });
             }
         });
-        self.status(ui);
+        let now = ctx.input(|i| i.time);
+        if self
+            .browse
+            .sync(self.signature(config), now, !self.entries.is_empty())
+        {
+            self.entries.clear();
+            self.selected = None;
+            self.versions.clear();
+        }
+        if search_now {
+            self.browse.reset(now);
+            self.entries.clear();
+        }
+        if self.browse.pending() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        if self.browse.due(now) && !self.mutation_busy() {
+            self.search(ctx, config, key);
+        }
+        if self.mutation_busy() || self.error {
+            self.status(ui);
+        }
         let mut chosen = None;
-        egui::ScrollArea::vertical()
+        let mut list = egui::ScrollArea::vertical();
+        if std::mem::take(&mut self.browse.reset_scroll) {
+            list = list.vertical_scroll_offset(0.);
+        }
+        let area = list
             .id_salt(("content_results", resources))
             .auto_shrink([false, false])
-            .max_height(ui.available_height())
+            .min_scrolled_height(0.)
+            .max_height((ui.available_height() - 40.).max(0.))
             .show(ui, |ui| {
                 ui.add_enabled_ui(!self.mutation_busy(), |ui| {
                     for entry in &self.entries {
                         ui.push_id((&entry.id, entry.provider.label()), |ui| {
                             ui.group(|ui| {
                                 ui.horizontal(|ui| {
-                                    self.avatar(ui, entry, 52.);
+                                    self.avatar(ui, entry, 56.);
                                     let width = (ui.available_width() - 96.).max(40.);
                                     ui.vertical(|ui| {
                                         ui.set_width(width);
@@ -461,28 +527,36 @@ impl Content {
                                                 .truncate(),
                                         );
                                     });
-                                    let installed = resources
-                                        && self.installed_resources.iter().any(|r| {
-                                            r.provider == entry.provider && r.project == entry.id
-                                        });
+                                    let installed = maps
+                                        && crate::packs::map_path(&instance, entry)
+                                            .join("level.dat")
+                                            .is_file()
+                                        || resources
+                                            && self.installed_resources.iter().any(|r| {
+                                                r.provider == entry.provider
+                                                    && r.project == entry.id
+                                            });
                                     if ui
-                                        .add_enabled_ui(!installed && !blocked, |ui| {
-                                            ui::icon_button(
-                                                ui,
-                                                if installed {
-                                                    Icon::Check
-                                                } else {
-                                                    Icon::Download
-                                                },
-                                                if installed {
-                                                    "Установлено"
-                                                } else if resources {
-                                                    "Скачать совместимую версию"
-                                                } else {
-                                                    "Выбрать версию и скачать"
-                                                },
-                                            )
-                                        })
+                                        .add_enabled_ui(
+                                            !installed && !blocked && !self.busy,
+                                            |ui| {
+                                                ui::icon_button(
+                                                    ui,
+                                                    if installed {
+                                                        Icon::Check
+                                                    } else {
+                                                        Icon::Download
+                                                    },
+                                                    if installed {
+                                                        "Установлено"
+                                                    } else if resources {
+                                                        "Скачать совместимую версию"
+                                                    } else {
+                                                        "Выбрать версию и скачать"
+                                                    },
+                                                )
+                                            },
+                                        )
                                         .inner
                                         .clicked()
                                     {
@@ -509,8 +583,24 @@ impl Content {
                     }
                 });
             });
+        if !self.busy
+            && self.selected.is_none()
+            && self.browse.more
+            && !self.browse.pending()
+            && !self.browse.failed
+            && crate::browse::near_end(
+                area.state.offset.y,
+                area.inner_rect.height(),
+                area.content_size.y,
+            )
+        {
+            self.search(ctx, config, key);
+        }
+        if ui::catalog_footer(ui, self.entries.len(), self.busy, self.browse.failed).inner {
+            self.search(ctx, config, key);
+        }
         if let Some(entry) = chosen {
-            if resources {
+            if maps || resources {
                 let (key, mc, instance) = (
                     key.to_owned(),
                     config.profiles[config.selected].game_version.clone(),
@@ -518,6 +608,10 @@ impl Content {
                 );
                 self.start(ctx, true, move |tx, cancel, _| {
                     let result = Service::new(key).and_then(|s| {
+                        if maps {
+                            s.download_map(&entry, &mc, &instance, &cancel)?;
+                            return Ok(None);
+                        }
                         let versions = s.versions(&entry, true, &mc)?;
                         let version = versions
                             .first()

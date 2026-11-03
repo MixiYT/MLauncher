@@ -4,11 +4,13 @@ mod appearance;
 mod assistant;
 mod auth;
 mod avatars;
+mod browse;
 mod content;
 mod downloads;
 mod effects;
 mod game;
 mod icons;
+mod instance;
 mod java;
 mod layout;
 mod manual;
@@ -42,6 +44,7 @@ enum Page {
     About,
     Logs,
     Help,
+    BuildEdit,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum VersionTab {
@@ -51,7 +54,7 @@ enum VersionTab {
     Exchange,
 }
 enum Event {
-    Search(anyhow::Result<Vec<Project>>),
+    Search(u64, usize, anyhow::Result<(String, Vec<Project>)>),
     Progress(String),
     Installed(anyhow::Result<usize>),
     Updated(anyhow::Result<bool>),
@@ -77,8 +80,6 @@ struct Launcher {
     config: Config,
     page: Page,
     secondary_page: Option<Page>,
-    secondary_at: Option<f64>,
-    secondary_started: bool,
     tx: Sender<Event>,
     rx: Receiver<Event>,
     busy: bool,
@@ -90,10 +91,11 @@ struct Launcher {
     installed: Vec<InstalledMod>,
     installed_tab: bool,
     resource_tab: bool,
+    maps_tab: bool,
     manual_trust: bool,
     key: String,
-    offset: usize,
     searched: bool,
+    mod_browse: browse::Browse,
     remove_candidate: Option<InstalledMod>,
     account_kind: Option<auth::AccountKind>,
     account_name: String,
@@ -137,20 +139,64 @@ struct Launcher {
     delete_build: Option<usize>,
     delete_build_folder: bool,
     avatars: avatars::Avatars,
+    build_editor: Option<instance::Editor>,
     ai_key: zeroize::Zeroizing<String>,
     ai_question: String,
     ai_report: String,
     ai_answer: String,
     ai_busy: bool,
     wallpaper_busy: bool,
-    closing_page: Option<Page>,
-    transition_at: Option<f64>,
-    transition_started: bool,
-    last_launcher_rect: Option<egui::Rect>,
-    last_detail_rect: Option<egui::Rect>,
     content: content::Content,
     resource_catalog: content::Content,
     brand: Option<egui::TextureHandle>,
+    panel_motion: std::collections::HashMap<layout::PanelId, PanelMotion>,
+}
+
+#[derive(Clone, Copy)]
+struct PanelMotion {
+    page: Page,
+    from_rect: egui::Rect,
+    to_rect: egui::Rect,
+    from_alpha: f32,
+    to_alpha: f32,
+    started: f64,
+}
+impl PanelMotion {
+    fn new(page: Page, rect: egui::Rect, now: f64, fade: bool) -> Self {
+        Self {
+            page,
+            from_rect: rect,
+            to_rect: rect,
+            from_alpha: if fade { 0. } else { 1. },
+            to_alpha: 1.,
+            started: now,
+        }
+    }
+    fn sample(self, now: f64) -> (egui::Rect, f32) {
+        let phase = ((now - self.started) / 0.20).clamp(0., 1.) as f32;
+        let eased = 1. - (1. - phase).powi(3);
+        (
+            self.from_rect.lerp_towards(&self.to_rect, eased),
+            egui::lerp(self.from_alpha..=self.to_alpha, eased),
+        )
+    }
+    fn active(self, now: f64) -> bool {
+        now - self.started < 0.20
+    }
+    fn target(&mut self, rect: egui::Rect, alpha: f32, now: f64, animate: bool) {
+        if !animate {
+            self.from_rect = rect;
+            self.to_rect = rect;
+            self.from_alpha = alpha;
+            self.to_alpha = alpha;
+            self.started = now - 1.;
+        } else if self.to_rect != rect || self.to_alpha != alpha {
+            (self.from_rect, self.from_alpha) = self.sample(now);
+            self.to_rect = rect;
+            self.to_alpha = alpha;
+            self.started = now;
+        }
+    }
 }
 
 struct GameSession {
@@ -200,8 +246,6 @@ impl Launcher {
             config,
             page: Page::Home,
             secondary_page: None,
-            secondary_at: None,
-            secondary_started: false,
             tx,
             rx,
             busy: false,
@@ -213,10 +257,11 @@ impl Launcher {
             installed: vec![],
             installed_tab: false,
             resource_tab: false,
+            maps_tab: false,
             manual_trust: false,
             key: std::env::var("CURSEFORGE_API_KEY").unwrap_or(cf_key),
-            offset: 0,
             searched: false,
+            mod_browse: Default::default(),
             remove_candidate: None,
             account_kind: None,
             account_name: String::new(),
@@ -260,17 +305,14 @@ impl Launcher {
             delete_build: None,
             delete_build_folder: false,
             avatars: Default::default(),
+            build_editor: None,
+            panel_motion: Default::default(),
             ai_key: zeroize::Zeroizing::new(ai_key),
             ai_question: String::new(),
             ai_report: String::new(),
             ai_answer: String::new(),
             ai_busy: false,
             wallpaper_busy: false,
-            closing_page: None,
-            transition_at: None,
-            transition_started: false,
-            last_launcher_rect: None,
-            last_detail_rect: None,
             content: Default::default(),
             resource_catalog: Default::default(),
             brand,
@@ -298,8 +340,8 @@ impl Launcher {
                     &app.key,
                     content::Section::Resources,
                 );
-                app.thumbnails.set_cache(app.root.join("cache/icons"));
             }
+            app.thumbnails.set_cache(app.root.join("cache/icons"));
             app.load_versions(ctx);
             app.background.load(
                 &app.config.appearance.background,
@@ -364,49 +406,28 @@ impl Launcher {
         self.account_totp.zeroize();
         if page == Page::Home {
             self.secondary_page = None;
-            self.secondary_at = None;
         }
-        if page != self.page {
-            self.closing_page = if page == Page::Home {
-                Some(self.page)
-            } else {
-                None
-            };
-            self.page = page;
-            self.transition_started = true;
-        }
+        self.page = page;
     }
     fn toggle_page(&mut self, page: Page) {
         if self.secondary_page == Some(page) {
             self.secondary_page = None;
-            self.secondary_at = None;
             return;
         }
         if self.page == page {
-            if let Some(previous) = self.secondary_page.take() {
-                self.navigate(previous);
-            } else {
-                self.navigate(Page::Home);
-            }
+            let previous = self.secondary_page.take().unwrap_or(Page::Home);
+            self.navigate(previous);
             return;
         }
         if self.page != Page::Home && self.secondary_page.is_none() {
-            // Keep the current page on the left and open the requested page on the right.
             self.secondary_page = Some(self.page);
-            self.secondary_started = true;
-            self.closing_page = None;
             self.page = page;
-            self.transition_started = true;
         } else {
             self.navigate(page);
         }
     }
     fn close_pages(&mut self) {
-        self.secondary_page = None;
-        self.secondary_at = None;
-        if self.page != Page::Home {
-            self.navigate(Page::Home);
-        }
+        self.navigate(Page::Home);
     }
     fn panel_id_of(&self, page: Page) -> layout::PanelId {
         use layout::PanelId;
@@ -420,6 +441,7 @@ impl Launcher {
             Page::About => PanelId::About,
             Page::Logs => PanelId::About,
             Page::Help => PanelId::Help,
+            Page::BuildEdit => PanelId::Instance,
         }
     }
     fn panel_id(&self) -> layout::PanelId {
@@ -439,6 +461,7 @@ impl Launcher {
             Page::About => PanelId::About,
             Page::Logs => PanelId::About,
             Page::Help => PanelId::Help,
+            Page::BuildEdit => PanelId::Instance,
         }
     }
     fn resize_panel(
@@ -547,7 +570,10 @@ impl Launcher {
         self.launch_status = "Подготовка…".into();
         self.error = false;
         self.status.clear();
-        let mut native_overlay = if !variant::LITE && self.config.multi_session.native_overlay {
+        let mut native_overlay = if !variant::LITE
+            && self.config.multi_session.native_overlay
+            && self.on_game_start() != model::OnGameStart::Close
+        {
             Some(overlay::Options::installed(
                 self.key.clone(),
                 self.config.appearance.accent,
@@ -568,7 +594,12 @@ impl Launcher {
             profile: self.config.profiles[self.config.selected].clone(),
             instance: self.config.instance_dir(&self.root),
             storage: self.config.game_root(&self.root).join("shared"),
-            settings: self.config.multi_session.java(&self.config.java),
+            settings: self.config.multi_session.java(
+                self.config.profiles[self.config.selected]
+                    .java
+                    .as_ref()
+                    .unwrap_or(&self.config.java),
+            ),
             identity,
         };
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -627,7 +658,7 @@ impl Launcher {
         self.refresh_installed();
         self.projects.clear();
         self.searched = false;
-        self.offset = 0;
+        self.mod_browse.invalidate();
         self.remove_candidate = None;
     }
     fn prune_missing_builds(&mut self) -> bool {
@@ -674,27 +705,31 @@ impl Launcher {
         });
     }
     fn search(&mut self, ctx: &egui::Context) {
-        if self.busy || self.config.profiles[self.config.selected].loader == "vanilla" {
+        if self.busy {
             return;
         }
-        self.busy = true;
+        let Some((revision, offset)) = self.mod_browse.begin() else {
+            return;
+        };
         self.error = false;
-        self.status = "Поиск…".into();
-        self.projects.clear();
-        let (key, source, query, offset, profile, tx, ctx) = (
+        self.status.clear();
+        let (key, source, query, profile, tx, ctx) = (
             self.key.clone(),
             self.source,
             self.query.clone(),
-            self.offset,
             self.config.profiles[self.config.selected].clone(),
             self.tx.clone(),
             ctx.clone(),
         );
         let options = self.search_options.clone();
+        let resolved = self.mod_browse.resolved_query.clone();
         std::thread::spawn(move || {
-            let result = api::Api::new(key)
-                .and_then(|a| a.search_filtered(source, &query, &profile, offset, &options));
-            let _ = tx.send(Event::Search(result));
+            let result = api::Api::new(key).and_then(|a| {
+                browse::search_variants(&query, resolved, |q| {
+                    a.search_filtered(source, q, &profile, offset, &options)
+                })
+            });
+            let _ = tx.send(Event::Search(revision, offset, result));
             ctx.request_repaint();
         });
     }
@@ -923,6 +958,15 @@ impl Launcher {
                         }
                         self.game_running = true;
                         self.launch_status = "Minecraft запущен".into();
+                        match self.on_game_start() {
+                            model::OnGameStart::KeepOpen => {}
+                            model::OnGameStart::Minimize => {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true))
+                            }
+                            model::OnGameStart::Close => {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close)
+                            }
+                        }
                     }
                     game::Event::Finished(result) => {
                         let cancelled =
@@ -971,16 +1015,34 @@ impl Launcher {
                         Err(e) => self.versions_status = format!("{e:#}"),
                     }
                 }
-                Event::Search(result) => {
-                    self.busy = false;
+                Event::Search(revision, offset, result) => {
+                    if !self.mod_browse.finish(
+                        revision,
+                        offset,
+                        result.as_ref().ok().map(|(_, projects)| projects.len()),
+                    ) {
+                        continue;
+                    }
                     self.searched = true;
                     match result {
-                        Ok(projects) => {
+                        Ok((query, projects)) => {
+                            self.mod_browse.resolved_query = Some(query);
                             self.thumbnails.request(
                                 projects.iter().map(|p| p.icon_url.clone()).collect(),
                                 ctx,
                             );
-                            self.projects = projects;
+                            if offset == 0 {
+                                self.projects.clear();
+                            }
+                            for project in projects {
+                                if !self
+                                    .projects
+                                    .iter()
+                                    .any(|p| p.source == project.source && p.id == project.id)
+                                {
+                                    self.projects.push(project);
+                                }
+                            }
                             self.status.clear();
                             self.error = false;
                         }
@@ -1189,7 +1251,7 @@ impl Launcher {
             if click(&mut columns[3], Icon::Mods, "Моды и ресурспаки") {
                 self.toggle_page(Page::Mods);
             }
-            if click(&mut columns[4], Icon::Menu, "Настройки") {
+            if click(&mut columns[4], Icon::Settings, "Настройки") {
                 self.toggle_page(Page::Settings);
             }
         });
@@ -1376,6 +1438,14 @@ impl Launcher {
         }
     }
 
+    fn on_game_start(&self) -> model::OnGameStart {
+        if self.config.multi_session.enabled || self.sessions.len() > 1 {
+            model::OnGameStart::KeepOpen
+        } else {
+            self.config.on_game_start
+        }
+    }
+
     fn settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if !variant::LITE {
             let old = serde_json::to_string(&self.config.multi_session).unwrap_or_default();
@@ -1507,6 +1577,26 @@ impl Launcher {
         }
     }
     fn java_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        use model::OnGameStart;
+        let modes = [
+            (OnGameStart::KeepOpen, "Оставаться открытым"),
+            (OnGameStart::Minimize, "Свернуться"),
+            (OnGameStart::Close, "Закрыться"),
+        ];
+        let mode = self.on_game_start();
+        ui.label("Лаунчер после запуска игры");
+        ui.add_enabled_ui(!self.config.multi_session.enabled, |ui| {
+            let response = egui::ComboBox::from_id_salt("on_game_start")
+                .selected_text(modes.iter().find(|(value, _)| *value == mode).unwrap().1)
+                .show_ui(ui, |ui| {
+                    for (value, label) in modes {
+                        ui.selectable_value(&mut self.config.on_game_start, value, label);
+                    }
+                });
+            response
+                .response
+                .on_hover_text("При закрытии лаунчера оверлей отключается.");
+        });
         ui.strong("Minecraft и Java");
         ui.add_enabled_ui(self.game_cancel.is_none(),|ui|{
             ui.label("Папка установки Minecraft");
@@ -1867,9 +1957,63 @@ impl Launcher {
         );
     }
 
+    fn edit_instance(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(mut editor) = self.build_editor.take() else {
+            ui.label("Выберите сборку в разделе «Мои сборки».");
+            if ui.button("Мои сборки").clicked() {
+                self.version_tab = VersionTab::Builds;
+                self.navigate(Page::Versions);
+            }
+            return;
+        };
+        let path = self
+            .config
+            .game_root(&self.root)
+            .join("instances")
+            .join(&editor.directory);
+        let blocked = self.sessions.iter().any(|s| s.instance == path)
+            || self.busy
+            || self.content_mutation_busy();
+        match editor.ui(ui, ctx, &path, blocked) {
+            Some(instance::Action::Save) => {
+                let result = editor.save(&mut self.config, &self.root);
+                if result.is_err() {
+                    editor.report(result);
+                }
+                self.refresh_installed();
+            }
+            Some(instance::Action::Close) => {
+                self.version_tab = VersionTab::Builds;
+                self.navigate(Page::Versions);
+            }
+            Some(instance::Action::Changed) => {
+                self.refresh_installed();
+                self.resource_catalog.invalidate_resources();
+            }
+            Some(instance::Action::Catalog(resources)) => {
+                if let Some(index) = self
+                    .config
+                    .profiles
+                    .iter()
+                    .position(|p| p.directory == editor.directory)
+                {
+                    self.config.selected = index;
+                    self.changed_instance();
+                    self.resource_tab = resources;
+                    self.maps_tab = false;
+                    self.installed_tab = !resources;
+                    self.navigate(Page::Mods);
+                }
+            }
+            None => {}
+        }
+        self.build_editor = Some(editor);
+    }
+
     fn my_builds(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
         let mut select = None;
         let mut start_edit = None;
+        let mut open_editor = None;
         let mut open_folder = None;
         let mut request_delete = None;
         let mut confirm_delete = None;
@@ -1939,10 +2083,16 @@ impl Launcher {
                                 {
                                     select = Some(index);
                                 }
-                                if icon_button(ui, Icon::Edit, "Переименовать").clicked()
-                                {
-                                    start_edit = Some(index);
+                                let edit = icon_button(ui, Icon::Edit, "Редактировать сборку");
+                                if edit.clicked() {
+                                    open_editor = Some(index);
                                 }
+                                edit.context_menu(|ui| {
+                                    if ui.button("Переименовать").clicked() {
+                                        start_edit = Some(index);
+                                        ui.close_menu();
+                                    }
+                                });
                                 if icon_button(ui, Icon::Folder, "Открыть папку").clicked()
                                 {
                                     open_folder = Some(index);
@@ -1956,7 +2106,9 @@ impl Launcher {
                                 {
                                     request_delete = Some(index);
                                 }
-                                ui.label(RichText::new(&directory).small());
+                                ui.add(
+                                    egui::Label::new(RichText::new(&directory).small()).truncate(),
+                                );
                             });
                         }
                         if self.delete_build == Some(index) {
@@ -1980,6 +2132,13 @@ impl Launcher {
                     ui.separator();
                 }
             });
+        if let Some(index) = open_editor {
+            self.build_editor = Some(instance::Editor::new(
+                &self.config.profiles[index],
+                &self.config.java,
+            ));
+            self.navigate(Page::BuildEdit);
+        }
         if let Some(index) = start_edit {
             if let Some(profile) = self.config.profiles.get(index) {
                 self.edit_build_name = profile.name.clone();
@@ -1993,7 +2152,6 @@ impl Launcher {
             self.refresh_installed();
             self.projects.clear();
             self.searched = false;
-            self.offset = 0;
             self.navigate(Page::Home);
         }
         if let Some(index) = open_folder {
@@ -2263,14 +2421,37 @@ impl Launcher {
                 self.resource_tab = false;
                 self.installed_tab = true;
             }
-            if ui::icon_tab(ui, Icon::Resources, "Ресурспаки", self.resource_tab).clicked()
+            if ui::icon_tab(
+                ui,
+                Icon::Resources,
+                "Ресурспаки",
+                self.resource_tab && !self.maps_tab,
+            )
+            .clicked()
+                && !self.resource_catalog.busy
             {
                 self.resource_tab = true;
+                self.maps_tab = false;
+            }
+            if ui::icon_tab(
+                ui,
+                Icon::Builds,
+                "Карты",
+                self.resource_tab && self.maps_tab,
+            )
+            .clicked()
+                && !self.resource_catalog.busy
+            {
+                self.resource_tab = true;
+                self.maps_tab = true;
             }
         });
         if self.resource_tab {
-            self.resource_catalog
-                .set_section(content::Section::Resources);
+            self.resource_catalog.set_section(if self.maps_tab {
+                content::Section::Maps
+            } else {
+                content::Section::Resources
+            });
             self.resource_catalog
                 .ui(ui, ctx, &self.root, &self.config, &self.key, self.busy);
             return;
@@ -2287,7 +2468,6 @@ impl Launcher {
                 self.instance_name.clear();
                 self.navigate(Page::Versions);
             }
-            return;
         }
         if let Some(item) = self.remove_candidate.clone() {
             ui.group(|ui| {
@@ -2338,12 +2518,79 @@ impl Launcher {
                 .max_height((ui.available_height() - 40.).max(64.))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    let width = ui.available_width();
                     for item in &self.installed {
-                        let text_width = (ui.available_width() - 140.).max(80.);
-                        egui::Grid::new(("installed_row", &item.project_id))
-                            .num_columns(4)
-                            .spacing(Vec2::splat(layout::GRID))
-                            .show(ui, |ui| {
+                        let disabled =
+                            model::mod_path(&self.config.instance_dir(&self.root), &item.filename)
+                                .is_ok_and(|path| {
+                                    path.extension().is_some_and(|ext| ext == "disabled")
+                                });
+                        let has_update = self
+                            .updates
+                            .get(&Self::mod_key(item.source, &item.project_id))
+                            .and_then(|value| value.as_ref())
+                            .is_some_and(|version| *version != item.version_id);
+                        // Anchor actions to the list edge before allocating the text column.
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(width, layout::ROW),
+                            egui::Layout::right_to_left(egui::Align::Min),
+                            |ui| {
+                                if ui
+                                    .add_enabled_ui(!self.busy, |ui| {
+                                        icon_button(ui, Icon::Trash, "Удалить")
+                                    })
+                                    .inner
+                                    .clicked()
+                                {
+                                    remove = Some(item.clone());
+                                }
+                                if has_update {
+                                    if ui
+                                        .add_enabled_ui(!self.busy, |ui| {
+                                            icon_button(ui, Icon::Refresh, "Доступно обновление")
+                                        })
+                                        .inner
+                                        .clicked()
+                                    {
+                                        update = Some(item.clone());
+                                    }
+                                } else {
+                                    ui.allocate_space(Vec2::new(40., layout::ROW));
+                                }
+                                let text_width =
+                                    (ui.available_width() - 42. - ui.spacing().item_spacing.x)
+                                        .max(0.);
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(text_width, 0.),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        ui.set_width(text_width);
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(if disabled {
+                                                    format!("{} (отключён)", item.name)
+                                                } else {
+                                                    item.name.clone()
+                                                })
+                                                .strong(),
+                                            )
+                                            .truncate(),
+                                        )
+                                        .on_hover_text(format!("{}\n{}", item.name, item.filename));
+                                        if !item.description.is_empty() {
+                                            ui.add(egui::Label::new(&item.description).wrap());
+                                        }
+                                        if !item.categories.is_empty() {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(item.categories.join(" · "))
+                                                        .small(),
+                                                )
+                                                .wrap(),
+                                            );
+                                        }
+                                    },
+                                );
                                 if let Some(texture) = self.thumbnails.get(&item.icon_url) {
                                     ui.add(
                                         egui::Image::new(texture)
@@ -2356,46 +2603,8 @@ impl Launcher {
                                         .0;
                                     ui::paint_icon(ui, Icon::Mods, rect, ui.visuals().text_color());
                                 }
-                                ui.vertical(|ui| {
-                                    ui.set_width(text_width);
-                                    ui.strong(&item.name).on_hover_text(&item.filename);
-                                    if !item.description.is_empty() {
-                                        ui.add(egui::Label::new(&item.description).wrap());
-                                    }
-                                    if !item.categories.is_empty() {
-                                        ui.label(
-                                            RichText::new(item.categories.join(" · ")).small(),
-                                        );
-                                    }
-                                });
-                                let has_update = self
-                                    .updates
-                                    .get(&Self::mod_key(item.source, &item.project_id))
-                                    .and_then(|value| value.as_ref())
-                                    .is_some_and(|version| *version != item.version_id);
-                                if has_update {
-                                    if ui
-                                        .add_enabled_ui(!self.busy, |ui| {
-                                            icon_button(ui, Icon::Refresh, "Доступно обновление")
-                                        })
-                                        .inner
-                                        .clicked()
-                                    {
-                                        update = Some(item.clone());
-                                    }
-                                } else {
-                                    ui.label("");
-                                }
-                                if ui
-                                    .add_enabled_ui(!self.busy, |ui| {
-                                        icon_button(ui, Icon::Trash, "Удалить")
-                                    })
-                                    .inner
-                                    .clicked()
-                                {
-                                    remove = Some(item.clone());
-                                }
-                            });
+                            },
+                        );
                     }
                     if self.installed.is_empty() {
                         ui.label("Пока пусто");
@@ -2417,7 +2626,6 @@ impl Launcher {
                 if old != self.source {
                     self.projects.clear();
                     self.searched = false;
-                    self.offset = 0;
                     self.search_options.category = None;
                     self.category_error.clear();
                 }
@@ -2497,12 +2705,39 @@ impl Launcher {
                 );
                 #[cfg(test)]
                 ctx.data_mut(|data| data.insert_temp(egui::Id::new("mods_search_bounds"), r.rect));
+                if r.changed() {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(360));
+                }
                 search = icon_button(ui, Icon::Search, "Найти").clicked()
                     || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
             });
         });
-        if search || filter_changed || (!self.searched && !self.busy) {
-            self.offset = 0;
+        let now = ctx.input(|i| i.time);
+        let profile = &self.config.profiles[self.config.selected];
+        let signature = format!(
+            "{}|{}|{}|{}|{}|{:?}",
+            self.source,
+            self.query.trim(),
+            profile.game_version,
+            profile.loader,
+            self.search_options.sort.modrinth(),
+            self.search_options.category
+        );
+        if self
+            .mod_browse
+            .sync(signature, now, self.searched && !self.projects.is_empty())
+        {
+            self.projects.clear();
+            self.searched = false;
+        }
+        if search || filter_changed {
+            self.mod_browse.reset(now);
+            self.projects.clear();
+        }
+        if self.mod_browse.pending() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        if self.mod_browse.due(now) && !self.busy {
             self.search(ctx);
         }
         if self.source == Source::CurseForge
@@ -2513,75 +2748,75 @@ impl Launcher {
         }
         let mut install = None;
         let mut link = None;
-        let _list_area = egui::ScrollArea::vertical()
+        let mut list = egui::ScrollArea::vertical();
+        if std::mem::take(&mut self.mod_browse.reset_scroll) {
+            list = list.vertical_scroll_offset(0.);
+        }
+        let _list_area = list
             .id_salt("mod_results")
             .max_height((ui.available_height() - 40.).max(64.))
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                if self.projects.is_empty() && !self.busy {
-                    ui.label(if self.searched {
-                        "Ничего не найдено"
+                if self.projects.is_empty()
+                    && !self.busy
+                    && !self.mod_browse.loading
+                    && !self.mod_browse.pending()
+                {
+                    if self.error && !self.status.is_empty() {
+                        ui.colored_label(ui.visuals().error_fg_color, &self.status);
                     } else {
-                        "Введите название или нажмите поиск"
-                    });
+                        ui.label(if self.searched {
+                            "Ничего не найдено"
+                        } else {
+                            "Введите название или нажмите поиск"
+                        });
+                    }
                 }
                 for p in &self.projects {
                     ui.push_id(&p.id, |ui| {
                         ui.group(|ui| {
                             ui.set_min_width(ui.available_width());
-                            let text_width = (ui.available_width() - 160.).max(64.);
-                            egui::Grid::new("mod_header_grid")
-                                .num_columns(4)
-                                .spacing(Vec2::splat(layout::GRID))
-                                .show(ui, |ui| {
-                                    if let Some(icon) = self.thumbnails.get(&p.icon_url) {
-                                        ui.add(
-                                            egui::Image::new(icon)
-                                                .fit_to_exact_size(Vec2::splat(56.))
-                                                .corner_radius(5.),
-                                        );
-                                    } else {
-                                        let (rect, _) = ui.allocate_exact_size(
-                                            Vec2::splat(56.),
-                                            egui::Sense::hover(),
-                                        );
-                                        ui.painter().rect_filled(
-                                            rect,
-                                            5.,
-                                            ui.visuals().selection.bg_fill,
-                                        );
-                                        ui.painter().text(
-                                            rect.center(),
-                                            egui::Align2::CENTER_CENTER,
-                                            p.name.chars().next().unwrap_or('?'),
-                                            egui::FontId::proportional(26.),
-                                            ui.visuals().text_color(),
-                                        );
-                                    }
-                                    ui.vertical(|ui| {
-                                        ui.set_width(text_width);
-                                        ui.add(
-                                            egui::Label::new(RichText::new(&p.name).strong())
-                                                .truncate(),
-                                        );
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(format!(
-                                                    "{} · ↓ {}",
-                                                    p.author,
-                                                    compact_number(p.downloads)
-                                                ))
-                                                .small(),
-                                            )
+                            // Reserve 8 px per gap so the actions never spill out of the card.
+                            let width = ui.available_width();
+                            let text_width =
+                                (width - 56. - 40. - 40. - 3. * layout::GRID - layout::GRID)
+                                    .max(64.);
+                            ui.horizontal(|ui| {
+                                ui::catalog_thumbnail(
+                                    ui,
+                                    self.thumbnails.get(&p.icon_url),
+                                    Icon::Mods,
+                                    56.,
+                                );
+                                ui.vertical(|ui| {
+                                    ui.set_width(text_width);
+                                    ui.add(
+                                        egui::Label::new(RichText::new(&p.name).strong())
                                             .truncate(),
-                                        );
-                                    });
-                                    let exists = self
-                                        .installed
-                                        .iter()
-                                        .any(|m| m.source == p.source && m.project_id == p.id);
-                                    if ui
-                                        .add_enabled_ui(!self.busy && !exists, |ui| {
+                                    );
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(format!(
+                                                "{} · ↓ {}",
+                                                p.author,
+                                                compact_number(p.downloads)
+                                            ))
+                                            .small(),
+                                        )
+                                        .truncate(),
+                                    );
+                                });
+                                let exists = self
+                                    .installed
+                                    .iter()
+                                    .any(|m| m.source == p.source && m.project_id == p.id);
+                                if ui
+                                    .add_enabled_ui(
+                                        !self.busy
+                                            && !exists
+                                            && self.config.profiles[self.config.selected].loader
+                                                != "vanilla",
+                                        |ui| {
                                             icon_button(
                                                 ui,
                                                 if exists { Icon::Check } else { Icon::Download },
@@ -2591,17 +2826,18 @@ impl Launcher {
                                                     "Установить с зависимостями"
                                                 },
                                             )
-                                        })
-                                        .inner
-                                        .clicked()
-                                    {
-                                        install = Some(p.clone());
-                                    }
-                                    if icon_button(ui, Icon::Link, "Страница проекта").clicked()
-                                    {
-                                        link = Some(p.website.clone());
-                                    }
-                                });
+                                        },
+                                    )
+                                    .inner
+                                    .clicked()
+                                {
+                                    install = Some(p.clone());
+                                }
+                                if icon_button(ui, Icon::Link, "Страница проекта").clicked()
+                                {
+                                    link = Some(p.website.clone());
+                                }
+                            });
                             ui.add(egui::Label::new(&p.description).wrap());
                             ui.horizontal_wrapped(|ui| {
                                 for category in p
@@ -2648,29 +2884,28 @@ impl Launcher {
                 }
             }
         }
-        let _footer = ui.horizontal(|ui| {
-            if ui
-                .add_enabled_ui(!self.busy && self.offset > 0, |ui| {
-                    icon_button(ui, Icon::Back, "Предыдущая страница")
-                })
-                .inner
-                .clicked()
-            {
-                self.offset = self.offset.saturating_sub(20);
-                self.search(ctx);
-            }
-            ui.label(format!("{}", self.offset / 20 + 1));
-            if ui
-                .add_enabled_ui(!self.busy && self.projects.len() == 20, |ui| {
-                    icon_button(ui, Icon::Next, "Следующая страница")
-                })
-                .inner
-                .clicked()
-            {
-                self.offset += 20;
-                self.search(ctx);
-            }
-        });
+        if !self.busy
+            && !self.mod_browse.loading
+            && !self.mod_browse.pending()
+            && self.mod_browse.more
+            && !self.mod_browse.failed
+            && browse::near_end(
+                _list_area.state.offset.y,
+                _list_area.inner_rect.height(),
+                _list_area.content_size.y,
+            )
+        {
+            self.search(ctx);
+        }
+        let _footer = ui::catalog_footer(
+            ui,
+            self.projects.len(),
+            self.mod_browse.loading,
+            self.mod_browse.failed,
+        );
+        if _footer.inner {
+            self.search(ctx);
+        }
         #[cfg(test)]
         ctx.data_mut(|data| {
             data.insert_temp(egui::Id::new("mods_footer_bounds"), _footer.response.rect)
@@ -2686,6 +2921,7 @@ impl Launcher {
             Page::About => "О проекте",
             Page::Logs => "Журнал запуска",
             Page::Help => "ИИ-помощник",
+            Page::BuildEdit => "Редактирование сборки",
             Page::Home => "",
         };
         ui.horizontal(|ui| {
@@ -2707,6 +2943,8 @@ impl Launcher {
         ui.separator();
         if !variant::LITE && self.page == Page::Help {
             self.ai_ui(ui, ctx);
+        } else if self.page == Page::BuildEdit {
+            self.edit_instance(ui, ctx);
         } else if self.page == Page::Mods {
             self.mods(ui, ctx);
         } else if self.page == Page::Versions && self.instance_version.is_none() {
@@ -2900,18 +3138,7 @@ impl Launcher {
                     rect.min,
                     egui::pos2(rect.right() - 200., rect.bottom()),
                 );
-                let response = ui.interact(
-                    drag,
-                    ui.id().with("window_drag"),
-                    egui::Sense::click_and_drag(),
-                );
-                if response.drag_started() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                }
                 let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-                if response.double_clicked() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
-                }
                 ui.horizontal(|ui| {
                     if let Some(brand) = &self.brand {
                         ui.add(egui::Image::new(brand).fit_to_exact_size(Vec2::splat(24.)));
@@ -2949,6 +3176,21 @@ impl Launcher {
                         }
                     });
                 });
+                // Register the drag area after the title text, otherwise labels can win hit-testing.
+                let response = ui.interact(
+                    drag,
+                    ui.id().with("window_drag"),
+                    egui::Sense::click_and_drag(),
+                );
+                if response.drag_started() {
+                    if maximized {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
+                    }
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+                if response.double_clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                }
             });
         // Native decorations are disabled; preserve edge/corner resize gestures.
         let screen = ctx.screen_rect();
@@ -3011,9 +3253,7 @@ impl Launcher {
             self.changed_instance();
         }
         self.resource_catalog.drain(ctx);
-        if !variant::LITE {
-            self.avatars.refresh(&self.config.accounts, &self.root, ctx);
-        }
+        self.avatars.refresh(&self.config.accounts, &self.root, ctx);
         self.avatars.drain(ctx);
         self.thumbnails.drain(ctx);
         self.title_bar(ctx);
@@ -3079,131 +3319,87 @@ impl Launcher {
             ctx.screen_rect().max,
         );
         let time = ctx.input(|i| i.time);
-        if self.transition_started {
-            self.transition_at = Some(time);
-            self.transition_started = false;
-        }
-        let phase = if self.config.appearance.transitions {
-            self.transition_at
-                .map(|t| ((time - t) / 0.20).clamp(0., 1.) as f32)
-                .unwrap_or(1.)
-        } else {
-            1.
-        };
-        let eased = 1. - (1. - phase).powi(3);
-        let display_page = if phase < 1. {
-            self.closing_page.unwrap_or(self.page)
-        } else {
-            self.page
-        };
-        if phase >= 1. {
-            self.closing_page = None;
-            self.transition_at = None;
-        } else {
-            ctx.request_repaint();
-        }
         let real_page = self.page;
-        self.page = display_page;
-        let detail = if display_page == Page::Home {
-            None
-        } else {
-            Some(self.panel_id())
-        };
-        let secondary = self.secondary_page.filter(|page| {
-            *page != Page::Home
-                && *page != display_page
-                && self.panel_id_of(*page) != self.panel_id_of(display_page)
-        });
-        let secondary_id = secondary.map(|page| self.panel_id_of(page));
+        let detail = (real_page != Page::Home).then(|| self.panel_id_of(real_page));
+        let secondary = self
+            .secondary_page
+            .filter(|p| *p != Page::Home && Some(self.panel_id_of(*p)) != detail);
+        let secondary_id = secondary.map(|p| self.panel_id_of(p));
         let geometry = layout::Geometry::new_two(screen, &self.config.panels, secondary_id, detail);
-        let target = layout::Geometry::new_two(
-            screen,
-            &self.config.panels,
-            secondary_id,
-            if real_page == Page::Home {
-                None
-            } else {
-                Some(self.panel_id_of(real_page))
-            },
-        );
-        let launcher_rect = if phase < 1. {
-            self.last_launcher_rect
-                .unwrap_or(target.launcher)
-                .lerp_towards(&target.launcher, eased)
-        } else {
-            target.launcher
-        };
-        self.last_launcher_rect = Some(launcher_rect);
-        self.page = real_page;
-        let left_resize = layout::panel(ctx, layout::PanelId::Launcher, launcher_rect, |ui| {
-            self.launch_panel(ui);
+        let mut targets = vec![(layout::PanelId::Launcher, Page::Home, geometry.launcher)];
+        if let (Some(page), Some(id), Some(rect)) = (secondary, secondary_id, geometry.left) {
+            targets.push((id, page, rect));
+        }
+        if let (Some(id), Some(rect)) = (detail, geometry.detail) {
+            targets.push((id, real_page, rect));
+        }
+        let transitions = self.config.appearance.transitions;
+        for (id, page, rect) in &targets {
+            let motion = self.panel_motion.entry(*id).or_insert_with(|| {
+                PanelMotion::new(
+                    *page,
+                    *rect,
+                    time,
+                    transitions && *id != layout::PanelId::Launcher,
+                )
+            });
+            motion.page = *page;
+            motion.target(*rect, 1., time, transitions);
+        }
+        for (id, motion) in &mut self.panel_motion {
+            if !targets.iter().any(|(target, _, _)| target == id) {
+                motion.target(motion.to_rect, 0., time, transitions);
+            }
+        }
+        let mut panels: Vec<_> = self
+            .panel_motion
+            .iter()
+            .map(|(id, motion)| (*id, *motion))
+            .collect();
+        // The launcher is drawn first, followed by outgoing and current detail panels.
+        panels.sort_by_key(|(id, motion)| {
+            (
+                *id != layout::PanelId::Launcher,
+                motion.to_alpha > 0.,
+                id.key(),
+            )
         });
-        let secondary_resize =
-            if let (Some(page), Some(id), Some(rect)) = (secondary, secondary_id, geometry.left) {
-                if self.secondary_started {
-                    self.secondary_at = Some(time);
-                    self.secondary_started = false;
-                }
-                let alpha = if self.config.appearance.transitions {
-                    self.secondary_at
-                        .map(|started| ((time - started) / 0.20).clamp(0., 1.) as f32)
-                        .unwrap_or(1.)
-                } else {
-                    1.
-                };
-                if alpha < 1. {
-                    ctx.request_repaint();
-                }
-                let left_eased = 1. - (1. - alpha).powi(3);
-                let rect = rect.translate(Vec2::new(-(1. - left_eased) * 24., 0.));
+        let mut resize = vec![];
+        for (id, motion) in panels {
+            let (rect, opacity) = motion.sample(time);
+            if motion.active(time) {
+                ctx.request_repaint();
+            }
+            if opacity <= 0. {
+                continue;
+            }
+            let outgoing = motion.to_alpha == 0.;
+            let request = if id == layout::PanelId::Launcher {
+                layout::panel(ctx, id, rect, |ui| self.launch_panel(ui))
+            } else {
                 let current_page = self.page;
-                self.page = page;
-                let enabled = !self.content_mutation_busy()
-                    || self.content.mutation_busy() && page == Page::Versions
-                    || self.resource_catalog.mutation_busy() && page == Page::Mods;
-                let response = layout::panel_animated(ctx, id, rect, left_eased, |ui| {
+                self.page = motion.page;
+                let enabled = !outgoing
+                    && (!self.content_mutation_busy()
+                        || self.content.mutation_busy() && motion.page == Page::Versions
+                        || self.resource_catalog.mutation_busy() && motion.page == Page::Mods);
+                let result = layout::panel_animated(ctx, id, rect, opacity, |ui| {
                     ui.add_enabled_ui(enabled, |ui| self.detail_panel(ui, ctx));
                 });
-                self.page = current_page;
-                response
-            } else {
-                None
+                if outgoing || self.page == motion.page {
+                    self.page = current_page;
+                }
+                result
             };
-        let right_resize = if let Some((id, rect)) = detail
-            .zip(geometry.detail)
-            .filter(|_| self.page == real_page)
-        {
-            let closing = self.closing_page.is_some();
-            let opacity = if closing { 1. - eased } else { eased };
-            let rect = if phase < 1. && !closing {
-                self.last_detail_rect
-                    .unwrap_or(rect)
-                    .lerp_towards(&rect, eased)
-            } else {
-                rect
+            if !outgoing {
+                if let Some(request) = request {
+                    resize.push(request);
+                }
             }
-            .translate(Vec2::new((1. - opacity) * 24., 0.));
-            self.last_detail_rect = Some(rect);
-            let current_page = self.page;
-            self.page = display_page;
-            let enabled = !closing
-                && (!self.content_mutation_busy()
-                    || self.content.mutation_busy() && display_page == Page::Versions
-                    || self.resource_catalog.mutation_busy() && display_page == Page::Mods);
-            let response = layout::panel_animated(ctx, id, rect, opacity, |ui| {
-                ui.add_enabled_ui(enabled, |ui| self.detail_panel(ui, ctx));
-            });
-            if closing {
-                self.page = current_page;
-            }
-            response
-        } else {
-            None
-        };
-        for request in [left_resize, secondary_resize, right_resize]
-            .into_iter()
-            .flatten()
-        {
+        }
+        self.panel_motion
+            .retain(|_, motion| motion.to_alpha > 0. || motion.active(time));
+        for request in resize {
             self.resize_panel(request, screen, ctx);
         }
         // Save the normal outer viewport size too; maximizing is temporary, not a new preference.
@@ -3295,6 +3491,7 @@ fn smoke_test() -> anyhow::Result<()> {
     println!("Mojang: {} versions, all categories OK", all.len());
     let api = api::Api::new(std::env::var("CURSEFORGE_API_KEY").unwrap_or_default())?;
     let profile = Profile {
+        java: None,
         name: "Test".into(),
         game_version: "1.21.1".into(),
         loader: "fabric".into(),
@@ -3513,6 +3710,201 @@ mod ui_tests {
             assert!(used.right() <= inner.right() + 1.);
             assert!(used.bottom() <= inner.bottom() + 1.);
         }
+    }
+    #[test]
+    fn closing_two_panels_keeps_each_geometry_until_fade_finishes() {
+        let ctx = egui::Context::default();
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.appearance.transitions = true;
+        let mut app = Launcher::new(&ctx, root.path().into(), config, false, String::new());
+        app.page = Page::Accounts;
+        app.secondary_page = Some(Page::Settings);
+        let size = Vec2::new(1600., 1000.);
+        frame(&mut app, &ctx, size, 0., vec![]);
+        frame(&mut app, &ctx, size, 0.3, vec![]);
+        let accounts = app.panel_motion[&layout::PanelId::Accounts].sample(0.3).0;
+        let settings = app.panel_motion[&layout::PanelId::Settings].sample(0.3).0;
+        app.close_pages();
+        frame(&mut app, &ctx, size, 1., vec![]);
+        for (id, rect) in [
+            (layout::PanelId::Accounts, accounts),
+            (layout::PanelId::Settings, settings),
+        ] {
+            let motion = app.panel_motion[&id];
+            assert_eq!(motion.sample(1.).0, rect);
+            assert_eq!(motion.sample(1.).1, 1.);
+            assert!(motion.sample(1.1).1 > 0. && motion.sample(1.1).1 < 1.);
+        }
+        // Reopening halfway starts at the current position and opacity.
+        let before = app.panel_motion[&layout::PanelId::Accounts].sample(1.1);
+        app.toggle_page(Page::Accounts);
+        frame(&mut app, &ctx, size, 1.1, vec![]);
+        assert_eq!(
+            app.panel_motion[&layout::PanelId::Accounts].sample(1.1),
+            before
+        );
+        frame(&mut app, &ctx, size, 1.4, vec![]);
+        assert!(!app.panel_motion.contains_key(&layout::PanelId::Settings));
+        assert_eq!(
+            app.panel_motion[&layout::PanelId::Accounts].sample(1.4).1,
+            1.
+        );
+    }
+
+    #[test]
+    fn installed_rows_keep_actions_beside_their_text() {
+        for width in [360., 640., 1128.] {
+            for (updates, busy) in [(false, false), (true, false), (true, true)] {
+                check_installed_rows(width, updates, busy);
+            }
+        }
+    }
+
+    fn check_installed_rows(width: f32, updates: bool, busy: bool) {
+        let ctx = egui::Context::default();
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.profiles[0].loader = "fabric".into();
+        std::fs::create_dir_all(
+            root.path()
+                .join("instances")
+                .join(&config.profiles[0].directory),
+        )
+        .unwrap();
+        let mut app = Launcher::new(&ctx, root.path().into(), config, false, String::new());
+        app.page = Page::Mods;
+        app.installed_tab = true;
+        let description =
+            "A long example description that wraps onto several lines inside the narrow panel.";
+        for i in 0..3 {
+            app.installed.push(InstalledMod {
+                name: format!(
+                    "Example {i} with a very long title that must fit in the text column"
+                ),
+                description: description.into(),
+                filename: "example.jar".into(),
+                categories: vec![
+                    "fabric".into(),
+                    "neoforge".into(),
+                    "optimization".into(),
+                    "decoration".into(),
+                    "quilt".into(),
+                ],
+                icon_url: String::new(),
+                project_id: format!("p{i}"),
+                source: Source::Modrinth,
+                version_id: "v".into(),
+            });
+        }
+        if updates {
+            for i in [0, 2] {
+                app.updates.insert(
+                    Launcher::mod_key(Source::Modrinth, &format!("p{i}")),
+                    Some("new".into()),
+                );
+            }
+        }
+        app.busy = busy;
+        let size = Vec2::new(1600., 1000.);
+        let mut titles = Vec::new();
+        let mut trashes = Vec::new();
+        for i in 0..4 {
+            titles.clear();
+            trashes.clear();
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    time: Some(i as f64 * 0.1),
+                    ..Default::default()
+                },
+                |ctx| {
+                    layout::panel(
+                        ctx,
+                        layout::PanelId::Mods,
+                        egui::Rect::from_min_size(egui::pos2(16., 16.), Vec2::new(width, 800.)),
+                        |ui| {
+                            app.mods(ui, ctx);
+                        },
+                    );
+                },
+            );
+            for clipped in &output.shapes {
+                match &clipped.shape {
+                    egui::epaint::Shape::Text(text) => {
+                        if text.galley.job.text.starts_with("Example ") {
+                            titles
+                                .push((text.galley.job.text.clone(), text.visual_bounding_rect()));
+                        }
+                    }
+                    // Action buttons are 40x32 widgets inside the list columns.
+                    egui::epaint::Shape::Rect(shape)
+                        if shape.rect.width().round() == 40.
+                            && shape.rect.height().round() == 32. =>
+                    {
+                        assert!(
+                            clipped.clip_rect.contains_rect(shape.rect),
+                            "action must be fully visible: {:?} / {:?}",
+                            shape.rect,
+                            clipped.clip_rect
+                        );
+                        trashes.push(shape.rect);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(titles.len(), 3, "every installed mod needs a title line");
+        let (inner, _) = layout::content_bounds(&ctx, layout::PanelId::Mods).unwrap();
+        let row_actions = trashes;
+        assert_eq!(row_actions.len(), if updates { 5 } else { 3 });
+        let delete_buttons: Vec<_> = row_actions
+            .iter()
+            .filter(|rect| (rect.right() - row_actions[0].right()).abs() < 1.)
+            .collect();
+        assert_eq!(
+            delete_buttons.len(),
+            3,
+            "delete buttons must form one column"
+        );
+        for rect in &row_actions {
+            assert!(
+                inner.contains_rect(*rect),
+                "row action {rect:?} must stay inside the list {inner:?}"
+            );
+            assert!(
+                rect.right() > titles[0].1.right(),
+                "row action {rect:?} must sit right of the text column"
+            );
+        }
+        // Each action must be horizontally beside the row it belongs to.
+        let mut row_tops: Vec<f32> = titles.iter().map(|t| t.1.top()).collect();
+        row_tops.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        for rect in &row_actions {
+            assert!(
+                row_tops.iter().any(|top| (rect.top() - top).abs() < 24.),
+                "row action {rect:?} is not level with any row title {row_tops:?}"
+            );
+        }
+        let mut previous = f32::NEG_INFINITY;
+        for (label, rect) in &titles {
+            // Rows must stack downwards, never jump back above the previous row.
+            assert!(
+                rect.top() > previous,
+                "{label} at {rect:?} overlaps the previous row"
+            );
+            previous = rect.top();
+            assert!(
+                rect.right() <= inner.right(),
+                "{label} at {rect:?} escapes the panel {inner:?}"
+            );
+        }
+        // Text must start right next to the icon column, not far below it.
+        let first = titles[0].1;
+        assert!(
+            first.top() - inner.top() < 200.,
+            "first row is pushed down: {first:?} inside {inner:?}"
+        );
     }
     #[test]
     fn resourcepack_category_stays_in_mods_panel() {

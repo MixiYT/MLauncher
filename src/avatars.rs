@@ -15,10 +15,16 @@ pub struct Avatars {
     receivers: Vec<mpsc::Receiver<(String, ColorImage)>>,
 }
 pub fn key(account: &Account) -> String {
+    let name = if account.kind == AccountKind::ElyBy || account.ely_skins {
+        account.name.as_str()
+    } else {
+        ""
+    };
     format!(
-        "{}-{}-{}",
+        "{}-{}-{}-{}",
         crate::auth::kind_key(account.kind),
         account.uuid,
+        name,
         account.ely_skins
     )
 }
@@ -32,6 +38,9 @@ impl Avatars {
                     id.clone(),
                     ctx.load_texture(&id, fallback(&a.uuid), TextureOptions::NEAREST),
                 );
+                if a.kind == AccountKind::Offline && !a.ely_skins {
+                    continue;
+                }
                 jobs.push((
                     id,
                     a.name.clone(),
@@ -55,13 +64,21 @@ impl Avatars {
             else {
                 return;
             };
+            // Publish every cached face before waiting for any network request.
+            let mut refresh = Vec::new();
             for (id, name, uuid, ely) in jobs {
                 let cache = root.join(format!("{}.png", crate::model::directory_from_name(&id)));
                 let cached = std::fs::read(&cache).ok().and_then(|b| face(&b).ok());
+                let valid = cached.is_some();
                 if let Some(image) = cached {
                     let _ = tx.send((id.clone(), image));
                     ctx.request_repaint();
                 }
+                if !valid || !fresh(&cache) {
+                    refresh.push((id, name, uuid, ely, cache));
+                }
+            }
+            for (id, name, uuid, ely, cache) in refresh {
                 if let Ok(bytes) = skin(&client, &name, &uuid, ely) {
                     if let Ok(image) = face(&bytes) {
                         let _ = crate::downloads::atomic_write(&cache, &bytes);
@@ -73,18 +90,31 @@ impl Avatars {
         });
     }
     pub fn drain(&mut self, ctx: &egui::Context) {
-        for rx in &self.receivers {
-            while let Ok((id, image)) = rx.try_recv() {
-                self.textures.insert(
-                    id.clone(),
-                    ctx.load_texture(id, image, TextureOptions::NEAREST),
-                );
+        self.receivers.retain(|rx| loop {
+            match rx.try_recv() {
+                Ok((id, image)) => {
+                    self.textures.insert(
+                        id.clone(),
+                        ctx.load_texture(id, image, TextureOptions::NEAREST),
+                    );
+                }
+                Err(mpsc::TryRecvError::Empty) => return true,
+                Err(mpsc::TryRecvError::Disconnected) => return false,
             }
-        }
+        });
     }
+
     pub fn get(&self, a: &Account) -> Option<&TextureHandle> {
         self.textures.get(&key(a))
     }
+}
+const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+fn fresh(path: &std::path::Path) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|time| time.elapsed().ok())
+        .is_some_and(|age| age < CACHE_TTL)
 }
 fn bounded(response: reqwest::blocking::Response) -> Result<Vec<u8>> {
     let mut bytes = vec![];
@@ -192,6 +222,19 @@ fn fallback(uuid: &str) -> ColorImage {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn avatar_cache_expires_after_a_day() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("skin.png");
+        assert!(!super::fresh(&path));
+        let file = std::fs::File::create(&path).unwrap();
+        assert!(super::fresh(&path));
+        file.set_times(std::fs::FileTimes::new().set_modified(
+            std::time::SystemTime::now() - super::CACHE_TTL - std::time::Duration::from_secs(1),
+        ))
+        .unwrap();
+        assert!(!super::fresh(&path));
+    }
     #[test]
     fn face_crop_and_hat() {
         let mut skin = image::RgbaImage::new(64, 64);

@@ -579,7 +579,7 @@ impl Drop for Thumbnails {
         self.epoch.fetch_add(1, Ordering::Relaxed);
     }
 }
-fn download_icon(client: &reqwest::blocking::Client, url: &str) -> Result<ColorImage> {
+pub(crate) fn download_icon(client: &reqwest::blocking::Client, url: &str) -> Result<ColorImage> {
     let parsed = reqwest::Url::parse(url)?;
     if parsed.scheme() != "https" || !parsed.host_str().is_some_and(icon_host_allowed) {
         bail!("Недопустимый CDN иконки");

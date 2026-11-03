@@ -77,18 +77,58 @@ pub fn parse_major(text: &str) -> Option<u32> {
         Some(first)
     }
 }
+// Oracle's javapath/java.exe can be a forwarding process rather than the JVM.
+// Resolve java.home from the runtime itself, so process lifetime, cancellation
+// and the native overlay all belong to the actual Minecraft process.
+fn runtime_executable(requested: &Path, properties: &str) -> Result<PathBuf> {
+    let home = properties
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == "java.home").then(|| PathBuf::from(value.trim()))
+        })
+        .context("Java не сообщила java.home")?;
+    anyhow::ensure!(home.is_absolute(), "Java сообщила относительный java.home");
+    let executable = home
+        .join("bin")
+        .join(if cfg!(windows) { "java.exe" } else { "java" });
+    anyhow::ensure!(
+        executable.is_file(),
+        "В java.home нет исполняемого файла Java: {}",
+        requested.display()
+    );
+    Ok(executable)
+}
+fn has_runtime(path: &Path) -> bool {
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let Some(bin) = resolved.parent() else {
+        return false;
+    };
+    if cfg!(windows) {
+        bin.join("server/jvm.dll").is_file() || bin.join("client/jvm.dll").is_file()
+    } else {
+        bin.parent().is_some_and(|home| {
+            home.join("lib/server/libjvm.so").is_file()
+                || home.join("lib/server/libjvm.dylib").is_file()
+        })
+    }
+}
 pub fn probe(path: &Path) -> Result<Installation> {
+    // Property output can exceed the capacity of a Windows pipe. Capture to a
+    // temporary file so the bounded process wait cannot deadlock on stderr.
+    use std::io::{Read, Seek, SeekFrom};
+    let mut capture = tempfile::tempfile()?;
     let mut child = command(path)
-        .arg("-version")
+        .args(["-XshowSettings:properties", "-version"])
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(capture.try_clone()?))
         .spawn()
         .context("Не удалось запустить Java")?;
     let start = Instant::now();
-    loop {
-        if child.try_wait()?.is_some() {
-            break;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
         }
         if start.elapsed() > Duration::from_secs(8) {
             let _ = child.kill();
@@ -96,24 +136,24 @@ pub fn probe(path: &Path) -> Result<Installation> {
             bail!("Java не отвечает");
         }
         std::thread::sleep(Duration::from_millis(40));
-    }
-    let output = child.wait_with_output()?;
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    if !output.status.success() {
-        bail!("Java завершилась с ошибкой");
-    }
+    };
+    anyhow::ensure!(status.success(), "Java завершилась с ошибкой");
+    capture.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    capture.take(128 * 1024).read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
     let major = parse_major(&text).context("Не удалось определить версию Java")?;
     if text.contains("32-Bit") || text.contains("Client VM") {
         bail!("Нужна 64-битная Java");
     }
     Ok(Installation {
-        path: path.to_path_buf(),
+        path: runtime_executable(path, &text)?,
         major,
-        description: text.lines().next().unwrap_or("Java").to_owned(),
+        description: text
+            .lines()
+            .find(|line| line.contains("version \""))
+            .unwrap_or("Java")
+            .to_owned(),
     })
 }
 fn scan_directory(root: &Path, depth: usize, paths: &mut Vec<PathBuf>) {
@@ -205,7 +245,16 @@ pub fn select(
     if let Ok(text) = fs::read_to_string(&marker) {
         let path = PathBuf::from(text.trim());
         if path.is_file() {
-            return Ok(path);
+            if has_runtime(&path) {
+                return Ok(path);
+            }
+            // Migrate markers written by older builds that cached Oracle shims.
+            if let Ok(installation) = probe(&path) {
+                if installation.major == major {
+                    let _ = fs::write(&marker, installation.path.to_string_lossy().as_bytes());
+                    return Ok(installation.path);
+                }
+            }
         }
     }
     progress(format!("Поиск Java {major}…"));
@@ -321,6 +370,65 @@ pub fn java_command(path: &Path) -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn java_home_resolves_forwarders_and_never_falls_back_to_the_shim() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("Real JDK");
+        fs::create_dir_all(home.join("bin/server")).unwrap();
+        let binary = home
+            .join("bin")
+            .join(if cfg!(windows) { "java.exe" } else { "java" });
+        fs::write(&binary, b"runtime").unwrap();
+        let shim = root.path().join("javapath/java.exe");
+        let output = format!("Property settings:\n    java.home = {}\n    java.vendor = Oracle\njava version \"21.0.11\"",home.display());
+        assert_eq!(runtime_executable(&shim, &output).unwrap(), binary);
+        assert!(runtime_executable(&shim, "java version \"21.0.11\"").is_err());
+        assert!(!has_runtime(&shim));
+        fs::write(
+            home.join(if cfg!(windows) {
+                "bin/server/jvm.dll"
+            } else {
+                "lib/server/libjvm.so"
+            }),
+            b"jvm",
+        )
+        .ok();
+        if cfg!(windows) {
+            assert!(has_runtime(&binary));
+        }
+    }
+    #[test]
+    #[ignore = "Requires the locally installed Oracle javapath forwarder"]
+    fn oracle_forwarder_and_old_marker_resolve_to_the_real_runtime() {
+        let shim = Path::new(r"C:\Program Files\Common Files\Oracle\Java\javapath\java.exe");
+        let installation = probe(shim).unwrap();
+        assert!(has_runtime(&installation.path));
+        assert!(!installation.path.to_string_lossy().contains("javapath"));
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("metadata")).unwrap();
+        let marker = root
+            .path()
+            .join("metadata")
+            .join(format!("java-{}.txt", installation.major));
+        fs::write(&marker, shim.to_string_lossy().as_bytes()).unwrap();
+        let resolved = select(
+            root.path(),
+            installation.major,
+            &JavaSettings::default(),
+            &AtomicBool::new(false),
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(resolved, installation.path);
+        assert_eq!(
+            fs::read_to_string(marker).unwrap(),
+            resolved.to_string_lossy()
+        );
+        println!(
+            "Oracle forwarder + cached marker resolve to {}",
+            resolved.display()
+        );
+    }
     #[test]
     fn versions() {
         assert_eq!(parse_major("java version \"1.8.0_452\""), Some(8));

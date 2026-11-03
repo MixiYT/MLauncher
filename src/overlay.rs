@@ -46,6 +46,7 @@ struct State {
     workers: AtomicUsize,
     download: AtomicBool,
     projects: Mutex<Vec<crate::packs::Entry>>,
+    maps: Mutex<Vec<crate::packs::Entry>>,
     native_status: Mutex<Option<String>>,
 }
 pub struct Bridge {
@@ -71,6 +72,7 @@ impl Bridge {
             workers: AtomicUsize::new(0),
             download: AtomicBool::new(false),
             projects: Mutex::new(vec![]),
+            maps: Mutex::new(vec![]),
             native_status: Mutex::new(None),
         });
         let shared = state.clone();
@@ -128,6 +130,50 @@ impl Drop for Bridge {
         self.state.stop.store(true, Ordering::Relaxed);
         let _ = TcpStream::connect(("127.0.0.1", self.port));
     }
+}
+
+fn catalog_thumbnails(entries: &[crate::packs::Entry]) -> Vec<Option<String>> {
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(4))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    else {
+        return vec![None; entries.len()];
+    };
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = entries
+            .chunks(5)
+            .map(|chunk| {
+                let client = &client;
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|entry| {
+                            let image =
+                                crate::media::download_icon(client, &entry.icon_url).ok()?;
+                            let [width, height] = image.size;
+                            let mut hex = String::with_capacity(32 * 32 * 8);
+                            use std::fmt::Write;
+                            for y in 0..32 {
+                                for x in 0..32 {
+                                    let pixel =
+                                        image.pixels[y * height / 32 * width + x * width / 32];
+                                    for channel in pixel.to_srgba_unmultiplied() {
+                                        let _ = write!(hex, "{channel:02x}");
+                                    }
+                                }
+                            }
+                            Some(hex)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("thumbnail worker"))
+            .collect()
+    })
 }
 
 fn response(stream: &mut TcpStream, code: u16, body: Value) -> Result<()> {
@@ -223,7 +269,8 @@ fn serve(mut stream: TcpStream, state: &State) -> Result<()> {
         };
         let service = crate::packs::Service::new(state.key.to_string())?;
         match request[1] {
-            "/resources" => {
+            "/resources" | "/maps" => {
+                let maps = request[1] == "/maps";
                 let query = body["query"].as_str().unwrap_or("");
                 anyhow::ensure!(query.len() <= 256, "Слишком длинный запрос");
                 let sort = match body["sort"].as_str().unwrap_or("downloads") {
@@ -232,18 +279,43 @@ fn serve(mut stream: TcpStream, state: &State) -> Result<()> {
                     "newest" => crate::model::SortOrder::Newest,
                     _ => crate::model::SortOrder::Downloads,
                 };
-                let entries = service.search_sorted(provider, query, true, &state.mc, sort)?;
+                let (_, entries) = crate::browse::search_variants(query, None, |query| {
+                    if maps {
+                        service.search_maps(query, &state.mc, sort, 0)
+                    } else {
+                        service.search_sorted(provider, query, true, &state.mc, sort)
+                    }
+                })?;
                 let entries: Vec<_> = entries.into_iter().take(20).collect();
-                *state
-                    .projects
+                let catalog = if maps { &state.maps } else { &state.projects };
+                *catalog
                     .lock()
                     .map_err(|_| anyhow::anyhow!("Каталог недоступен"))? = entries.clone();
-                // Only a server-issued project may be downloaded. No client URLs or local paths.
                 let installed = crate::packs::resources(&state.instance);
-                let entries:Vec<_>=entries.into_iter().take(20).map(|e|json!({"id":e.id,"name":e.name,"description":e.description.chars().take(220).collect::<String>(),"author":e.author,"installed":installed.iter().any(|r|r.project==e.id&&r.provider==provider)})).collect();
+                let thumbnails = catalog_thumbnails(&entries);
+                let entries: Vec<_> = entries
+                    .into_iter()
+                    .zip(thumbnails)
+                    .map(|(entry, icon)| {
+                        let installed = if maps {
+                            crate::packs::map_path(&state.instance, &entry)
+                                .join("level.dat")
+                                .is_file()
+                        } else {
+                            installed.iter().any(|record| {
+                                record.project == entry.id && record.provider == provider
+                            })
+                        };
+                        json!({
+                            "id": entry.id, "name": entry.name, "author": entry.author,
+                            "description": entry.description.chars().take(220).collect::<String>(),
+                            "installed": installed, "icon": icon,
+                        })
+                    })
+                    .collect();
                 Ok(json!({"entries":entries,"minecraft":state.mc,"name":state.name}))
             }
-            "/download" => {
+            "/download" | "/download-map" => {
                 anyhow::ensure!(
                     !state.download.swap(true, Ordering::SeqCst),
                     "Уже идёт загрузка"
@@ -263,19 +335,24 @@ fn serve(mut stream: TcpStream, state: &State) -> Result<()> {
                             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
                     "Некорректный проект"
                 );
-                let entry = state
-                    .projects
+                let maps = request[1] == "/download-map";
+                let catalog = if maps { &state.maps } else { &state.projects };
+                let entry = catalog
                     .lock()
                     .map_err(|_| anyhow::anyhow!("Каталог недоступен"))?
                     .iter()
                     .find(|e| e.provider == provider && e.id == id)
                     .cloned()
-                    .context("Сначала найдите ресурспак в каталоге")?;
+                    .context("Сначала найдите проект в каталоге")?;
+                if maps {
+                    service.download_map(&entry, &state.mc, &state.instance, &state.stop)?;
+                    return Ok(json!({"message":"Карта скачана"}));
+                }
                 let versions = service.versions(&entry, true, &state.mc)?;
                 let version = versions.first().context("Нет совместимой версии")?;
                 service.resource(&entry, &version.id, &state.instance, &state.stop)?;
                 REVISION.fetch_add(1, Ordering::Relaxed);
-                Ok(json!({"message":"Ресурспак скачан. Включите его в настройках Minecraft."}))
+                Ok(json!({"message":"Ресурспак скачан"}))
             }
             _ => anyhow::bail!("Неизвестная операция"),
         }
@@ -547,7 +624,8 @@ pub fn smoke_test() -> Result<()> {
     println!("{}", String::from_utf8_lossy(&result.stdout));
     anyhow::ensure!(
         result.status.success(),
-        "OpenGL smoke failed: {}",
+        "OpenGL smoke failed ({}): {}",
+        result.status,
         String::from_utf8_lossy(&result.stderr)
     );
     anyhow::ensure!(output.is_file(), "Нет снимка framebuffer");

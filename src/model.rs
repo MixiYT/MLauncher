@@ -30,6 +30,8 @@ pub struct Profile {
     /// Имя папки инстанса; совпадает с названием сборки, но очищено для файловой системы.
     #[serde(default)]
     pub directory: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub java: Option<crate::java::JavaSettings>,
 }
 
 /// Безопасное имя папки из названия сборки. Никаких разделителей и зарезервированных имён Windows.
@@ -96,6 +98,14 @@ pub fn unique_directory<'a>(name: &str, used: impl Iterator<Item = &'a str>) -> 
     format!("{base}-{}", uuid::Uuid::new_v4().simple())
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OnGameStart {
+    #[default]
+    KeepOpen,
+    Minimize,
+    Close,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Config {
     pub profiles: Vec<Profile>,
@@ -122,6 +132,8 @@ pub struct Config {
     pub multi_session: MultiSession,
     #[serde(default)]
     pub curseforge_manual: bool,
+    #[serde(default)]
+    pub on_game_start: OnGameStart,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -166,6 +178,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             profiles: vec![Profile {
+                java: None,
                 name: "1.21.1 · Vanilla".into(),
                 game_version: "1.21.1".into(),
                 loader: "vanilla".into(),
@@ -183,6 +196,7 @@ impl Default for Config {
             assistant: Default::default(),
             multi_session: Default::default(),
             curseforge_manual: false,
+            on_game_start: OnGameStart::default(),
         }
     }
 }
@@ -221,6 +235,7 @@ impl Config {
         };
         let directory = unique_directory(&name, self.profiles.iter().map(|p| p.directory.as_str()));
         self.profiles.push(Profile {
+            java: None,
             name,
             game_version: version.into(),
             loader: loader.into(),
@@ -486,12 +501,28 @@ pub fn safe_filename(name: &str) -> Result<&str> {
     Ok(name)
 }
 
+/// Resolve the physical file without re-enabling a deliberately disabled mod.
+pub fn mod_path(instance: &Path, filename: &str) -> Result<PathBuf> {
+    safe_filename(filename)?;
+    let active = instance.join("mods").join(filename);
+    let disabled = instance.join("mods").join(format!("{filename}.disabled"));
+    Ok(if !active.exists() && disabled.is_file() {
+        disabled
+    } else {
+        active
+    })
+}
+
 pub fn installed(instance: &Path) -> Result<Vec<InstalledMod>> {
     let path = instance.join("mods.json");
     if !path.exists() {
         return Ok(vec![]);
     }
-    Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+    let entries: Vec<InstalledMod> = serde_json::from_slice(&std::fs::read(path)?)?;
+    Ok(entries
+        .into_iter()
+        .filter(|item| mod_path(instance, &item.filename).is_ok_and(|path| path.is_file()))
+        .collect())
 }
 
 #[cfg(test)]

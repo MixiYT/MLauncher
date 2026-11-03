@@ -83,7 +83,7 @@ impl Api {
             if self.key.trim().is_empty() {
                 bail!("Для CurseForge нужен API-ключ. Укажите его в настройках или CURSEFORGE_API_KEY.");
             }
-            req = req.header("x-api-key", &self.key);
+            req = req.header("x-api-key", self.key.trim());
         }
         let response = req.send()?;
         match response.status().as_u16() {
@@ -142,21 +142,16 @@ impl Api {
         offset: usize,
         options: &SearchOptions,
     ) -> Result<Vec<Project>> {
-        if profile.loader == "vanilla" {
-            bail!("Для модов нужен отдельный инстанс с загрузчиком");
+        let compatible_only = query.is_empty() && profile.loader != "vanilla";
+        let mut facets = vec![vec!["project_type:mod".to_owned()]];
+        if compatible_only {
+            facets.push(vec![format!("versions:{}", profile.game_version)]);
+            facets.push(vec![format!("categories:{}", profile.loader)]);
         }
-        let mut facets = json!([
-            ["project_type:mod"],
-            [format!("versions:{}", profile.game_version)],
-            [format!("categories:{}", profile.loader)]
-        ]);
         if let Some(category) = &options.category {
-            facets
-                .as_array_mut()
-                .expect("array")
-                .push(json!([format!("categories:{category}")]));
+            facets.push(vec![format!("categories:{category}")]);
         }
-        let v = match source {
+        let mut v = match source {
             Source::Modrinth => self.get(
                 &format!("{MR}/search"),
                 &[
@@ -164,30 +159,45 @@ impl Api {
                     ("limit", "20".into()),
                     ("offset", offset.to_string()),
                     ("index", options.sort.modrinth().into()),
-                    ("facets", facets.to_string()),
+                    ("facets", json!(facets).to_string()),
                 ],
                 source,
             )?,
-            Source::CurseForge => self.get(
-                &format!("{CF}/mods/search"),
-                &[
+            Source::CurseForge => {
+                let mut params = vec![
                     ("gameId", "432".into()),
                     ("classId", "6".into()),
                     ("searchFilter", query.into()),
-                    ("gameVersion", profile.game_version.clone()),
-                    ("modLoaderType", loader_id(&profile.loader)?.into()),
                     ("pageSize", "20".into()),
                     ("index", offset.to_string()),
                     ("sortField", options.sort.curseforge().into()),
-                    (
-                        "categoryId",
-                        options.category.clone().unwrap_or_else(|| "0".into()),
-                    ),
                     ("sortOrder", "desc".into()),
-                ],
-                source,
-            )?,
+                ];
+                if let Some(category) = &options.category {
+                    params.push(("categoryId", category.clone()));
+                }
+                self.get(&format!("{CF}/mods/search"), &params, source)?
+            }
         };
+        if source == Source::Modrinth
+            && offset == 0
+            && options.category.is_none()
+            && (1..=100).contains(&query.len())
+            && query
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+            && list(&v["hits"])?.is_empty()
+        {
+            match self.get(&format!("{MR}/project/{query}"), &[], source) {
+                Ok(project) if project["project_type"] == "mod" => v["hits"] = json!([project]),
+                Ok(_) => {}
+                Err(error)
+                    if error
+                        .downcast_ref::<reqwest::Error>()
+                        .is_some_and(|e| e.status() == Some(reqwest::StatusCode::NOT_FOUND)) => {}
+                Err(error) => return Err(error),
+            }
+        }
         list(
             &v[if source == Source::Modrinth {
                 "hits"
@@ -199,7 +209,10 @@ impl Api {
         .map(|p| {
             Ok(match source {
                 Source::Modrinth => Project {
-                    id: text(p, "project_id"),
+                    id: p["project_id"]
+                        .as_str()
+                        .unwrap_or_else(|| p["id"].as_str().unwrap_or_default())
+                        .to_owned(),
                     name: text(p, "title"),
                     description: text(p, "description"),
                     author: text(p, "author"),
@@ -412,7 +425,7 @@ impl Api {
             }
             if manifest.iter().any(|m| {
                 m.source == project.source && m.project_id == a.project && m.version_id == a.version
-            }) && mods.join(&a.filename).is_file()
+            }) && model::mod_path(instance, &a.filename)?.is_file()
             {
                 continue;
             }
@@ -638,13 +651,18 @@ impl Api {
         let staging = tempfile::tempdir_in(instance)?;
         progress(format!("Обновление {}: {}", item.name, latest.filename));
         self.download_artifact(&latest, staging.path(), cancel)?;
-        let old_path = mods.join(&item.filename);
+        let old_path = model::mod_path(instance, &item.filename)?;
+        let disabled = old_path.extension().is_some_and(|ext| ext == "disabled");
         let backup = staging.path().join("previous.jar");
         let had_old = old_path.exists();
         if had_old {
             std::fs::rename(&old_path, &backup)?;
         }
-        let destination = mods.join(&latest.filename);
+        let destination = mods.join(if disabled {
+            format!("{}.disabled", latest.filename)
+        } else {
+            latest.filename.clone()
+        });
         if let Err(error) = std::fs::hard_link(staging.path().join(&latest.filename), &destination)
         {
             if had_old {
@@ -682,7 +700,7 @@ fn save_manifest(instance: &Path, manifest: &[InstalledMod]) -> Result<()> {
 pub fn remove(instance: &Path, item: &InstalledMod) -> Result<()> {
     model::safe_filename(&item.filename)?;
     let mut manifest = model::installed(instance)?;
-    let path = instance.join("mods").join(&item.filename);
+    let path = model::mod_path(instance, &item.filename)?;
     // Move aside so a failed manifest write can restore the mod.
     let staging = tempfile::tempdir_in(instance)?;
     let backup = staging.path().join(&item.filename);
@@ -707,6 +725,22 @@ mod tests {
     fn loader_mapping() {
         assert_eq!(loader_id("neoforge").unwrap(), "6");
         assert!(loader_id("unknown").is_err());
+    }
+    #[test]
+    fn disabled_mods_keep_metadata_and_can_be_removed() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("mods")).unwrap();
+        let item = InstalledMod {
+            filename: "disabled.jar".into(),
+            project_id: "disabled".into(),
+            ..Default::default()
+        };
+        std::fs::write(root.path().join("mods/disabled.jar.disabled"), b"disabled").unwrap();
+        save_manifest(root.path(), std::slice::from_ref(&item)).unwrap();
+        assert_eq!(model::installed(root.path()).unwrap().len(), 1);
+        remove(root.path(), &item).unwrap();
+        assert!(!root.path().join("mods/disabled.jar.disabled").exists());
+        assert!(model::installed(root.path()).unwrap().is_empty());
     }
     #[test]
     fn removal_preserves_untracked_files() {
