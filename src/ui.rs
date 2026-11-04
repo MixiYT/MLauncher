@@ -21,6 +21,7 @@ pub enum Icon {
     Info,
     Edit,
     Builds,
+    MyBuilds,
     Close,
     Minimize,
     Maximize,
@@ -230,6 +231,11 @@ pub fn paint_icon(ui: &egui::Ui, icon: Icon, rect: Rect, color: Color32) {
         Icon::Restore => {
             outline(0.35, 0.15, 0.5, 0.5);
             outline(0.15, 0.35, 0.5, 0.5);
+        }
+        Icon::MyBuilds => {
+            outline(0.1, 0.34, 0.8, 0.52);
+            line((0.2, 0.15), (0.8, 0.15));
+            line((0.37, 0.53), (0.63, 0.53));
         }
         Icon::Builds => {
             // A three-dimensional block, rather than an ambiguous refresh arrow.

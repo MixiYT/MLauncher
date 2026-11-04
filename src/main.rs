@@ -55,6 +55,18 @@ enum VersionTab {
     Packs,
     Exchange,
 }
+impl VersionTab {
+    fn group(self, tabs: model::LibraryTabs) -> model::LibraryGroup {
+        use model::LibraryGroup;
+        match self {
+            Self::Catalog => LibraryGroup::Catalog,
+            Self::Builds => LibraryGroup::MyBuilds,
+            Self::Packs => tabs.packs,
+            Self::Exchange => tabs.exchange,
+        }
+    }
+}
+
 enum Event {
     Search(u64, usize, anyhow::Result<(String, Vec<Project>)>),
     Progress(String),
@@ -432,6 +444,20 @@ impl Launcher {
             self.navigate(page);
         }
     }
+    fn toggle_library(&mut self, tab: VersionTab) {
+        let tabs = self.config.library_tabs;
+        let open = self.page == Page::Versions || self.secondary_page == Some(Page::Versions);
+        let same_group = self.version_tab.group(tabs) == tab.group(tabs);
+        if !open || !same_group {
+            self.version_tab = tab;
+            self.instance_version = None;
+            if open {
+                return;
+            }
+        }
+        self.toggle_page(Page::Versions);
+    }
+
     fn close_pages(&mut self) {
         self.navigate(Page::Home);
     }
@@ -1266,14 +1292,14 @@ impl Launcher {
                 let width = ui.available_width();
                 ui::icon_button_size(ui, icon, label, Vec2::new(width, layout::ROW)).clicked()
             };
-            if click(&mut columns[0], Icon::Info, "О проекте") {
-                self.toggle_page(Page::About);
+            if click(&mut columns[0], Icon::MyBuilds, "Мои сборки") {
+                self.toggle_library(VersionTab::Builds);
             }
             if click(&mut columns[1], Icon::Folder, "Папка игры") {
                 self.open_folder();
             }
-            if click(&mut columns[2], Icon::Builds, "Версии и сборки") {
-                self.toggle_page(Page::Versions);
+            if click(&mut columns[2], Icon::Versions, "Каталог версий") {
+                self.toggle_library(VersionTab::Catalog);
             }
             if click(&mut columns[3], Icon::Mods, "Моды и ресурспаки") {
                 self.toggle_page(Page::Mods);
@@ -1474,6 +1500,34 @@ impl Launcher {
     }
 
     fn settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal_wrapped(|ui| {
+            if ui::icon_tab(ui, Icon::Info, "О проекте", false).clicked() {
+                self.toggle_page(Page::About);
+            }
+        });
+        ui.collapsing("Расположение вкладок", |ui| {
+            use model::LibraryGroup;
+            let previous = self.config.library_tabs;
+            let tabs = &mut self.config.library_tabs;
+            for (label, group) in [
+                ("Скачать сборку", &mut tabs.packs),
+                ("Импорт / экспорт", &mut tabs.exchange),
+            ] {
+                egui::ComboBox::from_label(label)
+                    .selected_text(match group {
+                        LibraryGroup::Catalog => "Каталог версий",
+                        LibraryGroup::MyBuilds => "Мои сборки",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(group, LibraryGroup::Catalog, "Каталог версий");
+                        ui.selectable_value(group, LibraryGroup::MyBuilds, "Мои сборки");
+                    });
+            }
+            if previous != *tabs {
+                let result = self.config.save(&self.root);
+                self.result(result, "");
+            }
+        });
         if !variant::LITE {
             let old = serde_json::to_string(&self.config.multi_session).unwrap_or_default();
             let old_manual = self.config.curseforge_manual;
@@ -2205,6 +2259,7 @@ impl Launcher {
 
     fn version_picker(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let previous = self.version_tab;
+        let tabs = self.config.library_tabs;
         ui.add_enabled_ui(!self.content.busy, |ui| {
             ui.horizontal_wrapped(|ui| {
                 for (tab, icon, label, tooltip) in [
@@ -2216,11 +2271,11 @@ impl Launcher {
                     ),
                     (
                         VersionTab::Builds,
-                        Icon::Folder,
+                        Icon::MyBuilds,
                         "Мои сборки",
                         "Управление установленными сборками",
                     ),
-                    (VersionTab::Packs, Icon::Builds, "Сборки", "Скачать сборку"),
+                    (VersionTab::Packs, Icon::Builds, "Скачать сборку", "Каталог сборок"),
                     (
                         VersionTab::Exchange,
                         Icon::Exchange,
@@ -2228,6 +2283,9 @@ impl Launcher {
                         "Импорт / экспорт сборок",
                     ),
                 ] {
+                    if tab.group(tabs) != previous.group(tabs) {
+                        continue;
+                    }
                     if ui::icon_tab(ui, icon, label, self.version_tab == tab)
                         .on_hover_text(tooltip)
                         .clicked()
@@ -2943,7 +3001,10 @@ impl Launcher {
         let title = match self.page {
             Page::Accounts => "Аккаунты",
             Page::Settings => "Настройки",
-            Page::Versions => "Версии и сборки",
+            Page::Versions => match self.version_tab.group(self.config.library_tabs) {
+                model::LibraryGroup::Catalog => "Каталог версий",
+                model::LibraryGroup::MyBuilds => "Мои сборки",
+            },
             Page::Mods => "Моды и ресурспаки",
             Page::About => "О проекте",
             Page::Logs => "Журнал запуска",

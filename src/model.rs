@@ -106,6 +106,20 @@ pub enum OnGameStart {
     Close,
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LibraryGroup {
+    #[default]
+    Catalog,
+    MyBuilds,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LibraryTabs {
+    pub packs: LibraryGroup,
+    pub exchange: LibraryGroup,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Config {
     pub profiles: Vec<Profile>,
@@ -120,6 +134,8 @@ pub struct Config {
     pub appearance: crate::appearance::Appearance,
     #[serde(default)]
     pub panels: crate::layout::PanelSizes,
+    #[serde(default)]
+    pub library_tabs: LibraryTabs,
     #[serde(default)]
     pub game_directory: String,
     #[serde(default)]
@@ -190,6 +206,7 @@ impl Default for Config {
             microsoft_client_id: String::new(),
             appearance: Default::default(),
             panels: Default::default(),
+            library_tabs: LibraryTabs::default(),
             game_directory: String::new(),
             java: Default::default(),
             version_filters: default_version_filters(),
