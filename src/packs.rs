@@ -1570,6 +1570,7 @@ fn finish(m: Manifest, staged: &Path, instances: &Path, cancel: &AtomicBool) -> 
     fs::rename(staged, &target)?;
     Ok(Profile {
         java: None,
+        icon: Default::default(),
         name: m.name,
         game_version: m.minecraft,
         loader: m.loader,
@@ -2125,6 +2126,7 @@ mod tests {
         .unwrap();
         let p = Profile {
             java: None,
+            icon: Default::default(),
             name: "Test".into(),
             game_version: "1.20.1".into(),
             loader: "fabric".into(),
@@ -2207,6 +2209,7 @@ mod tests {
         fs::write(instance.join("sessions.dat"), b"secret").unwrap();
         let p = Profile {
             java: None,
+            icon: Default::default(),
             name: "Test".into(),
             game_version: "1.20.1".into(),
             loader: "fabric".into(),

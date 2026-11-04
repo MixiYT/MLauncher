@@ -1,7 +1,7 @@
 //! Per-instance settings and local content management.
 use crate::{
     java,
-    model::{self, Config, Profile},
+    model::{self, BuildIcon, Config, Profile},
     ui::{self, Icon},
 };
 use anyhow::{Context, Result};
@@ -181,6 +181,16 @@ impl Editor {
             .auto_shrink([false, false]).show(ui, |ui| {
             if self.tab == Tab::General {
                 ui.add_enabled_ui(!blocked, |ui| {
+                    ui.label("Иконка сборки");
+                    ui.horizontal_wrapped(|ui| {
+                        for (preset, label) in BuildIcon::PRESETS {
+                            if ui::icon_tab(ui, preset.glyph(), label, self.draft.icon == preset)
+                                .clicked()
+                            {
+                                self.draft.icon = preset;
+                            }
+                        }
+                    });
                     ui.label("Название сборки");
                     ui.add(egui::TextEdit::singleline(&mut self.draft.name).desired_width(f32::INFINITY));
                 });

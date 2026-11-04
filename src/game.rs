@@ -1303,6 +1303,7 @@ pub fn loader_smoke_test() -> Result<()> {
             overlay: None,
             profile: crate::model::Profile {
                 java: None,
+                icon: Default::default(),
                 name: loader.into(),
                 game_version: mc.into(),
                 loader: loader.into(),

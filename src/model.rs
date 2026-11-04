@@ -22,9 +22,24 @@ impl std::fmt::Display for Source {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildIcon {
+    Block,
+    Mods,
+    Landscape,
+    Home,
+    Folder,
+    #[default]
+    #[serde(other)]
+    Box,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Profile {
     pub name: String,
+    #[serde(default)]
+    pub icon: BuildIcon,
     pub game_version: String,
     pub loader: String,
     /// Имя папки инстанса; совпадает с названием сборки, но очищено для файловой системы.
@@ -195,6 +210,7 @@ impl Default for Config {
         Self {
             profiles: vec![Profile {
                 java: None,
+                icon: Default::default(),
                 name: "1.21.1 · Vanilla".into(),
                 game_version: "1.21.1".into(),
                 loader: "vanilla".into(),
@@ -253,6 +269,7 @@ impl Config {
         let directory = unique_directory(&name, self.profiles.iter().map(|p| p.directory.as_str()));
         self.profiles.push(Profile {
             java: None,
+            icon: Default::default(),
             name,
             game_version: version.into(),
             loader: loader.into(),

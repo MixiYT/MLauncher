@@ -32,6 +32,28 @@ pub enum Icon {
     Upload,
 }
 
+impl crate::model::BuildIcon {
+    pub const PRESETS: [(Self, &'static str); 6] = [
+        (Self::Box, "Коробка"),
+        (Self::Block, "Блок"),
+        (Self::Mods, "Моды"),
+        (Self::Landscape, "Пейзаж"),
+        (Self::Home, "Дом"),
+        (Self::Folder, "Папка"),
+    ];
+
+    pub fn glyph(self) -> Icon {
+        match self {
+            Self::Box => Icon::MyBuilds,
+            Self::Block => Icon::Builds,
+            Self::Mods => Icon::Mods,
+            Self::Landscape => Icon::Resources,
+            Self::Home => Icon::Home,
+            Self::Folder => Icon::Folder,
+        }
+    }
+}
+
 pub fn icon_button(ui: &mut egui::Ui, icon: Icon, tooltip: &str) -> Response {
     icon_button_size(ui, icon, tooltip, Vec2::new(40., 32.))
 }
@@ -407,11 +429,13 @@ pub fn paint_icon(ui: &egui::Ui, icon: Icon, rect: Rect, color: Color32) {
             line((0.5, 0.45), (0.5, 0.75));
         }
         Icon::Edit => {
-            p.line_segment([at(0.18, 0.82), at(0.3, 0.55)], Stroke::new(5_f32, color));
-            p.line_segment([at(0.3, 0.55), at(0.68, 0.17)], Stroke::new(5_f32, color));
-            p.line_segment([at(0.68, 0.17), at(0.83, 0.32)], Stroke::new(5_f32, color));
-            p.line_segment([at(0.83, 0.32), at(0.45, 0.7)], Stroke::new(5_f32, color));
-            p.line_segment([at(0.45, 0.7), at(0.18, 0.82)], Stroke::new(5_f32, color));
+            p.add(egui::Shape::closed_line(
+                vec![at(0.14, 0.86), at(0.23, 0.57), at(0.69, 0.11),
+                     at(0.89, 0.31), at(0.43, 0.77)],
+                s,
+            ));
+            line((0.57, 0.23), (0.77, 0.43));
+            line((0.23, 0.57), (0.43, 0.77));
         }
     }
 }

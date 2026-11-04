@@ -1,6 +1,6 @@
 [package]
 name = "mlauncher"
-version = "0.3.6"
+version = "0.3.7"
 edition = "2021"
 description = "Rust Minecraft launcher with modpacks, resourcepacks and launch diagnostics"
 license = "MIT"
@@ -51,3 +51,4 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_Shel
 [build-dependencies]
 winres = "0.1"
 sha2 = "0.10"
+

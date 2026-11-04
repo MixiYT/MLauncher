@@ -24,6 +24,7 @@ mod secrets;
 #[cfg(windows)]
 mod tray;
 mod ui;
+mod updater;
 mod variant;
 mod versions;
 mod voxel;
@@ -68,6 +69,7 @@ impl VersionTab {
 }
 
 enum Event {
+    LauncherUpdate(anyhow::Result<Option<updater::Ready>>),
     Search(u64, usize, anyhow::Result<(String, Vec<Project>)>),
     Progress(String),
     Installed(anyhow::Result<usize>),
@@ -88,6 +90,9 @@ enum Event {
 
 struct Launcher {
     overlay_revision: u64,
+    launcher_update: Option<anyhow::Result<Option<updater::Ready>>>,
+    checking_launcher_update: bool,
+    install_update_pending: bool,
     sessions: Vec<GameSession>,
     next_session: u64,
     root: PathBuf,
@@ -256,6 +261,9 @@ impl Launcher {
         let (tx, rx) = mpsc::channel();
         let mut app = Self {
             overlay_revision: 0,
+            launcher_update: None,
+            checking_launcher_update: false,
+            install_update_pending: false,
             sessions: vec![],
             next_session: 1,
             root,
@@ -343,6 +351,9 @@ impl Launcher {
         }
         app.refresh_installed();
         if start_workers {
+            if cfg!(all(windows, target_arch = "x86_64")) {
+                app.check_launcher_update(ctx);
+            }
             if !variant::LITE {
                 app.content.warm(
                     ctx,
@@ -954,6 +965,15 @@ impl Launcher {
             ctx.request_repaint();
         });
     }
+    fn check_launcher_update(&mut self, ctx: &egui::Context) {
+        self.checking_launcher_update = true;
+        let (tx, ctx, root) = (self.tx.clone(), ctx.clone(), self.root.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(Event::LauncherUpdate(updater::download(&root)));
+            ctx.request_repaint();
+        });
+    }
+
     fn process_events(&mut self, ctx: &egui::Context) {
         let revision = overlay::REVISION.load(std::sync::atomic::Ordering::Relaxed);
         if revision != self.overlay_revision {
@@ -962,6 +982,16 @@ impl Launcher {
         }
         while let Ok(event) = self.rx.try_recv() {
             match event {
+                Event::LauncherUpdate(result) => {
+                    self.checking_launcher_update = false;
+                    self.install_update_pending = matches!(&result, Ok(Some(_)));
+                    if let Ok(Some(update)) = &result {
+                        if !self.busy && !self.error && self.status.is_empty() {
+                            self.status = format!("Обновление {} скачано. Архив доступен в настройках.", update.version);
+                        }
+                    }
+                    self.launcher_update = Some(result);
+                }
                 Event::Analysis(result) => {
                     self.ai_busy = false;
                     self.ai_answer = match result {
@@ -1500,6 +1530,33 @@ impl Launcher {
     }
 
     fn settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if cfg!(all(windows, target_arch = "x86_64")) {
+            let ready = matches!(self.launcher_update, Some(Ok(Some(_))));
+            egui::CollapsingHeader::new("Обновления лаунчера")
+                .default_open(ready)
+                .show(ui, |ui| {
+                    if self.checking_launcher_update {
+                        ui.label("Проверка GitHub и загрузка обновления…");
+                        return;
+                    }
+                    match &self.launcher_update {
+                        Some(Ok(Some(update))) => {
+                            ui.label(format!("Версия {} скачана.", update.version));
+                            ui.label("Автоустановка ждёт завершения игры и загрузок. Архив также можно распаковать вручную.");
+                            if ui.button("Открыть папку с архивом").clicked() {
+                                let result = open::that(update.archive.parent().unwrap_or(&self.root)).map_err(Into::into);
+                                self.result(result, "");
+                            }
+                        }
+                        Some(Ok(None)) => { ui.label("Новых версий для этой редакции нет."); }
+                        Some(Err(error)) => { ui.label(format!("Не удалось получить обновление: {error:#}")); }
+                        None => {}
+                    }
+                    if ui.button("Проверить обновления").clicked() {
+                        self.check_launcher_update(ctx);
+                    }
+                });
+        }
         ui.horizontal_wrapped(|ui| {
             if ui::icon_tab(ui, Icon::Info, "О проекте", false).clicked() {
                 self.toggle_page(Page::About);
@@ -2131,6 +2188,7 @@ impl Launcher {
                         break;
                     };
                     let name = profile.name.clone();
+                    let icon = profile.icon.glyph();
                     let version = profile.game_version.clone();
                     let loader = profile.loader.clone();
                     let directory = profile.directory.clone();
@@ -2150,6 +2208,7 @@ impl Launcher {
                             });
                         } else {
                             ui.horizontal(|ui| {
+                                ui::catalog_thumbnail(ui, None, icon, 24.);
                                 if ui
                                     .selectable_label(selected == index, &name)
                                     .on_hover_text("Сделать активной")
@@ -3560,6 +3619,27 @@ impl eframe::App for Launcher {
         #[cfg(windows)]
         self.tray.bind(_frame);
         self.render(ctx);
+        #[cfg(windows)]
+        if self.install_update_pending
+            && self.sessions.is_empty()
+            && self.game_cancel.is_none()
+            && !self.busy
+            && !self.content_mutation_busy()
+            && self.page != Page::BuildEdit
+            && self.secondary_page != Some(Page::BuildEdit)
+        {
+            self.install_update_pending = false;
+            if let Some(Ok(Some(update))) = &self.launcher_update {
+                match updater::install(update) {
+                    Ok(true) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                    Ok(false) => {}
+                    Err(error) => self.result(
+                        Err(error.context("Автоустановка не запустилась. Архив доступен в настройках")),
+                        "",
+                    ),
+                }
+            }
+        }
     }
 }
 
@@ -3582,6 +3662,7 @@ fn smoke_test() -> anyhow::Result<()> {
     let api = api::Api::new(std::env::var("CURSEFORGE_API_KEY").unwrap_or_default())?;
     let profile = Profile {
         java: None,
+        icon: Default::default(),
         name: "Test".into(),
         game_version: "1.21.1".into(),
         loader: "fabric".into(),
