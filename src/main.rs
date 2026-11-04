@@ -96,6 +96,7 @@ struct Launcher {
     sessions: Vec<GameSession>,
     next_session: u64,
     root: PathBuf,
+    cache_root: PathBuf,
     config: Config,
     page: Page,
     secondary_page: Option<Page>,
@@ -247,7 +248,14 @@ impl Launcher {
         let applied_appearance = config.appearance.clone();
         let background_path_input = config.appearance.background.clone();
         let (ai_key, cf_key) = secrets::load_api_keys(&root);
-        let background = media::Background::with_cache(&root);
+        let cache_root = if start_workers {
+            std::env::current_exe().ok()
+                .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+                .unwrap_or_else(|| root.clone())
+        } else {
+            root.clone()
+        }.join("MLauncher-cache").join(if variant::LITE { "lite" } else { "full" });
+        let background = media::Background::with_cache(&cache_root);
         let brand = media::decode_image(icons::bytes(), 32, 32)
             .ok()
             .map(|image| ctx.load_texture("brand-icon", image, egui::TextureOptions::LINEAR));
@@ -267,6 +275,7 @@ impl Launcher {
             sessions: vec![],
             next_session: 1,
             root,
+            cache_root,
             config,
             page: Page::Home,
             secondary_page: None,
@@ -354,23 +363,23 @@ impl Launcher {
             if cfg!(all(windows, target_arch = "x86_64")) {
                 app.check_launcher_update(ctx);
             }
+            app.content.set_cache(&app.cache_root);
+            app.resource_catalog.set_cache(&app.cache_root);
             if !variant::LITE {
                 app.content.warm(
                     ctx,
-                    &app.root,
                     &app.config,
                     &app.key,
                     content::Section::Packs,
                 );
                 app.resource_catalog.warm(
                     ctx,
-                    &app.root,
                     &app.config,
                     &app.key,
                     content::Section::Resources,
                 );
             }
-            app.thumbnails.set_cache(app.root.join("cache/icons"));
+            app.thumbnails.set_cache(app.cache_root.join("icons"));
             app.load_versions(ctx);
             app.background.load(
                 &app.config.appearance.background,
@@ -637,6 +646,7 @@ impl Launcher {
             profile: self.config.profiles[self.config.selected].clone(),
             instance: self.config.instance_dir(&self.root),
             storage: self.config.game_root(&self.root).join("shared"),
+            version_cache: self.cache_root.clone(),
             settings: self.config.multi_session.java(
                 self.config.profiles[self.config.selected]
                     .java
@@ -749,7 +759,7 @@ impl Launcher {
             return;
         }
         self.versions_loading = true;
-        let (tx, root, ctx) = (self.tx.clone(), self.root.clone(), ctx.clone());
+        let (tx, root, ctx) = (self.tx.clone(), self.cache_root.clone(), ctx.clone());
         std::thread::spawn(move || {
             let _ = tx.send(Event::Versions(versions::load(&root)));
             ctx.request_repaint();
@@ -1530,6 +1540,33 @@ impl Launcher {
     }
 
     fn settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.collapsing("Кеш лаунчера", |ui| {
+            ui.label(self.cache_root.display().to_string());
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Открыть папку").clicked() {
+                    let result = std::fs::create_dir_all(&self.cache_root)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|_| open::that(&self.cache_root).map_err(Into::into));
+                    self.result(result, "");
+                }
+                if ui.button("Очистить кеш").clicked() {
+                    let result = (|| -> anyhow::Result<()> {
+                        let base = self.cache_root.parent().unwrap();
+                        if !self.cache_root.try_exists()? {
+                            return Ok(());
+                        }
+                        let expected = base.parent().unwrap().canonicalize()?
+                            .join(base.file_name().unwrap())
+                            .join(self.cache_root.file_name().unwrap());
+                        anyhow::ensure!(self.cache_root.canonicalize()? == expected,
+                            "Путь кеша перенаправлен");
+                        std::fs::remove_dir_all(&self.cache_root)?;
+                        Ok(())
+                    })();
+                    self.result(result, "Кеш лаунчера очищен");
+                }
+            });
+        });
         if cfg!(all(windows, target_arch = "x86_64")) {
             let ready = matches!(self.launcher_update, Some(Ok(Some(_))));
             egui::CollapsingHeader::new("Обновления лаунчера")
@@ -3400,7 +3437,7 @@ impl Launcher {
             self.changed_instance();
         }
         self.resource_catalog.drain(ctx);
-        self.avatars.refresh(&self.config.accounts, &self.root, ctx);
+        self.avatars.refresh(&self.config.accounts, &self.cache_root, ctx);
         self.avatars.drain(ctx);
         self.thumbnails.drain(ctx);
         self.title_bar(ctx);

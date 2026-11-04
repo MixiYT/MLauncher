@@ -63,6 +63,7 @@ pub struct Request {
     pub profile: Profile,
     pub instance: PathBuf,
     pub storage: PathBuf,
+    pub version_cache: PathBuf,
     pub settings: JavaSettings,
     pub identity: Identity,
 }
@@ -106,18 +107,19 @@ fn artifact(value: &Value, root: &Path, fallback: Option<&str>) -> Result<Downlo
 fn metadata(
     client: &Client,
     storage: &Path,
+    version_cache: &Path,
     version: &str,
     cancel: &AtomicBool,
 ) -> Result<Metadata> {
     segment(version)?;
-    let cached = versions::cached(storage).ok();
+    let cached = versions::cached(version_cache).ok();
     let entry = match cached
         .as_ref()
         .and_then(|list| list.iter().find(|v| v.id == version))
     {
         Some(entry) => entry.clone(),
         None => {
-            let (list, _) = versions::load(storage)?;
+            let (list, _) = versions::load(version_cache)?;
             list.into_iter()
                 .find(|v| v.id == version)
                 .context("Версия отсутствует в официальном каталоге Mojang")?
@@ -528,6 +530,7 @@ fn progress_installer(
     let base = metadata(
         client,
         &request.storage,
+        &request.version_cache,
         &request.profile.game_version,
         cancel,
     )?;
@@ -864,6 +867,7 @@ fn prepare(
     let metadata = metadata(
         &client,
         &request.storage,
+        &request.version_cache,
         &request.profile.game_version,
         cancel,
     )?;
@@ -1311,6 +1315,7 @@ pub fn loader_smoke_test() -> Result<()> {
             },
             instance,
             storage: storage.clone(),
+            version_cache: storage.join("cache"),
             settings: java::JavaSettings {
                 auto_download: false,
                 ..Default::default()
@@ -1321,7 +1326,7 @@ pub fn loader_smoke_test() -> Result<()> {
             )?,
         };
         println!("Testing {loader} {mc} official installation…");
-        let metadata = metadata(&client, &storage, mc, &cancel)?;
+        let metadata = metadata(&client, &storage, &request.version_cache, mc, &cancel)?;
         let profile =
             loader_profile(&client, &request, &cancel, major)?.context("No loader profile")?;
         let libraries = libraries(&client, &metadata.value, Some(&profile), &storage, &cancel)?;

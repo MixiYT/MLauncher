@@ -66,19 +66,21 @@ impl Content {
     pub fn invalidate_resources(&mut self) {
         self.refresh_resources = true;
     }
+    pub fn set_cache(&mut self, root: &Path) {
+        self.cache_root = root.join("catalogs");
+        self.thumbnails.set_cache(root.join("icons"));
+    }
+
     pub fn warm(
         &mut self,
         ctx: &egui::Context,
-        root: &Path,
         config: &Config,
         key: &str,
         section: Section,
     ) {
         self.set_section(section);
-        self.cache_root = root.join("cache/catalogs");
         self.mc = config.profiles[config.selected].game_version.clone();
         self.entries = crate::packs::cached_entries(&self.cache_file());
-        self.thumbnails.set_cache(root.join("cache/icons"));
         self.thumbnails.request(
             self.entries.iter().map(|e| e.icon_url.clone()).collect(),
             ctx,
