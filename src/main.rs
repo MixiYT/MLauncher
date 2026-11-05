@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod api;
+mod agent;
 mod appearance;
 mod assistant;
 mod auth;
@@ -9,6 +10,7 @@ mod content;
 mod downloads;
 mod effects;
 mod game;
+mod glass;
 mod icons;
 mod instance;
 mod java;
@@ -96,6 +98,9 @@ enum Event {
     JavaFound(Vec<java::Installation>),
     Game(u64, game::Event),
     Analysis(anyhow::Result<String>),
+    AiPlan(anyhow::Result<assistant::Plan>),
+    AiApplied(anyhow::Result<agent::Outcome>),
+    AiUndone(anyhow::Result<agent::Outcome>),
     Wallpaper(anyhow::Result<String>),
 }
 
@@ -110,6 +115,7 @@ struct Launcher {
     scanning_builds: bool,
     root: PathBuf,
     cache_root: PathBuf,
+    glass: glass::Glass,
     config: Config,
     page: Page,
     secondary_page: Option<Page>,
@@ -180,6 +186,8 @@ struct Launcher {
     ai_report: String,
     ai_answer: String,
     ai_busy: bool,
+    ai_task: Option<agent::Task>,
+    ai_backup: Option<(PathBuf, PathBuf)>,
     wallpaper_busy: bool,
     content: content::Content,
     resource_catalog: content::Content,
@@ -291,6 +299,7 @@ impl Launcher {
             scanning_builds: false,
             root,
             cache_root,
+            glass: glass::Glass::default(),
             config,
             page: Page::Home,
             secondary_page: None,
@@ -362,11 +371,14 @@ impl Launcher {
             ai_report: String::new(),
             ai_answer: String::new(),
             ai_busy: false,
+            ai_task: None,
+            ai_backup: None,
             wallpaper_busy: false,
             content: Default::default(),
             resource_catalog: Default::default(),
             brand,
         };
+        app.glass.register(ctx);
         let removed = app.config.prune_missing(&app.root);
         if removed > 0 {
             app.config.ensure_default();
@@ -1037,6 +1049,12 @@ impl Launcher {
                     }
                     self.launcher_update = Some(result);
                 }
+                Event::AiPlan(result) => self.apply_ai_plan(result, ctx),
+                Event::AiApplied(result) => self.finish_ai_action(result, ctx),
+                Event::AiUndone(result) => {
+                    if result.is_ok() { self.ai_backup = None; }
+                    self.finish_ai_action(result, ctx);
+                }
                 Event::Analysis(result) => {
                     self.ai_busy = false;
                     self.ai_answer = match result {
@@ -1090,6 +1108,8 @@ impl Launcher {
                         }
                     }
                     game::Event::Finished(result) => {
+                        let ai_failed = !matches!(&result, Ok(0));
+                        let ai_owned = self.ai_task.as_ref().is_some_and(|task| task.session == Some(id));
                         let cancelled =
                             self.sessions.iter().find(|s| s.id == id).is_some_and(|s| {
                                 s.cancel.load(std::sync::atomic::Ordering::Relaxed)
@@ -1116,6 +1136,14 @@ impl Launcher {
                                 self.game_logs.push_back(error.clone());
                                 self.result(Err(anyhow::anyhow!(error)), "");
                                 self.navigate(Page::Logs);
+                            }
+                        }
+                        if ai_owned {
+                            if ai_failed && !cancelled {
+                                self.retry_ai(ctx, true);
+                            } else {
+                                self.ai_task = None;
+                                self.ai_answer.push_str("\nАвтоматизация завершена.");
                             }
                         }
                     }
@@ -1567,6 +1595,9 @@ impl Launcher {
     }
 
     fn on_game_start(&self) -> model::OnGameStart {
+        if self.ai_task.is_some() {
+            return model::OnGameStart::KeepOpen;
+        }
         if self.config.multi_session.enabled || self.sessions.len() > 1 {
             model::OnGameStart::KeepOpen
         } else {
@@ -1826,9 +1857,9 @@ impl Launcher {
         );
         if !variant::LITE {
             ui.checkbox(&mut self.config.curseforge_manual,"CurseForge: ручная загрузка (экспериментально)").on_hover_text("Официальный сайт в вашем браузере; затем выберите скачанный JAR. Не обходит запреты скачивания и не использует чужие API-ключи.");
-            ui.separator();
-            self.ai_settings(ui);
         }
+        ui.separator();
+        self.ai_settings(ui);
         if ui.button("Сохранить").clicked() {
             self.save();
         }
@@ -1856,7 +1887,7 @@ impl Launcher {
                 .on_hover_text("При закрытии лаунчера оверлей отключается.");
         });
         ui.strong("Minecraft и Java");
-        ui.add_enabled_ui(self.game_cancel.is_none(),|ui|{
+        ui.add_enabled_ui(self.game_cancel.is_none() && self.ai_task.is_none(),|ui|{
             ui.label("Папка установки Minecraft");
             ui.horizontal(|ui|{
                 let width=(ui.available_width()-48.).max(100.);ui.add_sized([width,layout::ROW],egui::TextEdit::singleline(&mut self.config.game_directory).hint_text(self.root.to_string_lossy()));
@@ -3300,7 +3331,7 @@ impl Launcher {
             });
         });
         ui.separator();
-        if !variant::LITE && self.page == Page::Help {
+        if self.page == Page::Help {
             self.ai_ui(ui, ctx);
         } else if self.page == Page::BuildEdit {
             self.edit_instance(ui, ctx);
@@ -3322,7 +3353,7 @@ impl Launcher {
                 if ui.button("Журнал запуска").clicked(){self.navigate(Page::Logs);}
             },
             Page::Logs=>{
-                if !variant::LITE&&ui.button("Разобрать ошибку с ИИ").clicked(){self.prepare_ai_report();self.navigate(Page::Help);}
+                if ui.button("Разобрать ошибку с ИИ").clicked(){self.prepare_ai_report();self.navigate(Page::Help);}
                 if ui.button("Открыть папку журналов").clicked(){let path=self.config.instance_dir(&self.root).join("launcher/logs");let result=std::fs::create_dir_all(&path).map_err(anyhow::Error::from).and_then(|_|open::that(path).map_err(Into::into));self.result(result,"");}
                 for line in &self.game_logs{ui.add(egui::Label::new(RichText::new(line).monospace().size(11.)).wrap());}
             },_=>{}
@@ -3334,6 +3365,9 @@ impl Launcher {
 impl Drop for Launcher {
     fn drop(&mut self) {
         self.persist_layout();
+        if let Some(task) = &self.ai_task {
+            task.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         use zeroize::Zeroize;
         self.account_password.zeroize();
         self.account_totp.zeroize();
@@ -3363,7 +3397,7 @@ impl Launcher {
         ui.text_edit_singleline(&mut self.config.assistant.model);
         ui.label("API-ключ (шифруется DPAPI)");
         ui.add(egui::TextEdit::singleline(&mut *self.ai_key).password(true));
-        ui.small("Журналы не отправляются автоматически. Перед отправкой можно проверить и отредактировать отчёт. Ответ ИИ — совет, не автоматическое исправление.");
+        ui.small("Журналы не отправляются автоматически. Перед отправкой можно проверить и отредактировать отчёт. Автоматические действия запускаются отдельной кнопкой в помощнике.");
         if ui.button("Открыть помощника").clicked() {
             self.navigate(Page::Help);
         }
@@ -3395,16 +3429,303 @@ impl Launcher {
         }
         assistant::sanitize(report, &secrets)
     }
+    fn begin_ai_task(&mut self, ctx: &egui::Context, repair_only: bool) {
+        if self.ai_busy || self.busy || self.content_mutation_busy() || !self.sessions.is_empty() {
+            self.ai_answer = "Дождитесь завершения игры и текущих операций.".into();
+            return;
+        }
+        self.ai_task = Some(agent::Task {
+            request: self.ai_question.trim().to_owned(),
+            profile: self.config.profiles[self.config.selected].clone(),
+            instances: self.config.game_root(&self.root).join("instances"),
+            default_java: self.config.java.clone(),
+            retries: 0,
+            max_repairs: self.config.assistant.max_repairs.clamp(1, 3),
+            auto_repair: self.config.assistant.auto_repair,
+            session: None,
+            repair_only,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        self.ai_answer.clear();
+        self.request_ai_plan(ctx);
+    }
+
+    fn request_ai_plan(&mut self, ctx: &egui::Context) {
+        let Some(task) = &self.ai_task else { return };
+        if task.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            self.ai_task = None;
+            self.ai_busy = false;
+            return;
+        }
+        let instance = task.instances.join(&task.profile.directory);
+        let mod_files = std::fs::read_dir(instance.join("mods"))
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".jar"))
+            .take(160)
+            .collect::<Vec<_>>();
+        let mut logs = self
+            .game_logs
+            .iter()
+            .filter(|line| {
+                task.session
+                    .map(|id| line.starts_with(&format!("[Сессия {id}]")))
+                    .unwrap_or(true)
+            })
+            .rev()
+            .take(200)
+            .cloned()
+            .collect::<Vec<_>>();
+        logs.reverse();
+        let available_versions = self
+            .version_list
+            .iter()
+            .filter(|version| version.kind == versions::VersionKind::Release)
+            .take(35)
+            .map(|version| version.id.clone())
+            .collect::<Vec<_>>();
+        let report = serde_json::json!({
+            "user_request": task.request,
+            "repair_only": task.repair_only,
+            "default_version": available_versions.first().map(String::as_str).unwrap_or("1.21.1"),
+            "available_versions": available_versions,
+            "current_profile": task.profile,
+            "mod_files": mod_files,
+            "log": logs,
+            "last_error": self.status,
+            "previous_result": self.ai_answer,
+        })
+        .to_string();
+        let report = self.sanitize_ai_report(&report);
+        let settings = self.config.assistant.clone();
+        let key = zeroize::Zeroizing::new(self.ai_key.to_string());
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        self.ai_busy = true;
+        self.navigate(Page::Help);
+        std::thread::spawn(move || {
+            let _ = tx.send(Event::AiPlan(assistant::plan(settings, key, report)));
+            ctx.request_repaint();
+        });
+    }
+
+    fn apply_ai_plan(&mut self, result: anyhow::Result<assistant::Plan>, ctx: &egui::Context) {
+        self.ai_busy = false;
+        let Some(task) = &self.ai_task else { return };
+        if task.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            self.ai_task = None;
+            self.ai_answer.push_str("\nЗапрос отменён.");
+            return;
+        }
+        let plan = match result {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.ai_answer = format!("Не удалось получить план: {error:#}");
+                self.ai_task = None;
+                return;
+            }
+        };
+        if self.busy
+            || self.content_mutation_busy()
+            || !self.sessions.is_empty()
+            || task.instances != self.config.game_root(&self.root).join("instances")
+            || !self
+                .config
+                .profiles
+                .iter()
+                .any(|profile| profile.directory == task.profile.directory)
+        {
+            self.ai_answer = "Сборка или её расположение изменились либо заняты. Повторите запрос после завершения текущих операций.".into();
+            self.ai_task = None;
+            return;
+        }
+        self.ai_answer = plan.explanation.clone();
+        let (profile, instances, default_java, repair_only, cancel) = (
+            task.profile.clone(),
+            task.instances.clone(),
+            task.default_java.clone(),
+            task.repair_only,
+            task.cancel.clone(),
+        );
+        let (tx, ctx, cache) = (self.tx.clone(), ctx.clone(), self.cache_root.clone());
+        self.ai_busy = true;
+        self.busy = true;
+        self.error = false;
+        self.status = "ИИ применяет план…".into();
+        self.mod_cancel = Some(cancel.clone());
+        std::thread::spawn(move || {
+            let result = agent::apply(
+                &plan,
+                &profile,
+                &instances,
+                &cache,
+                &default_java,
+                repair_only,
+                &cancel,
+                |message| {
+                    let _ = tx.send(Event::Progress(message));
+                    ctx.request_repaint();
+                },
+            );
+            let _ = tx.send(Event::AiApplied(result));
+            ctx.request_repaint();
+        });
+    }
+
+    fn finish_ai_action(&mut self, result: anyhow::Result<agent::Outcome>, ctx: &egui::Context) {
+        self.busy = false;
+        self.ai_busy = false;
+        self.mod_cancel = None;
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.ai_answer
+                    .push_str(&format!("\nОшибка выполнения: {error:#}"));
+                self.result(Err(error), "");
+                self.retry_ai(ctx, false);
+                return;
+            }
+        };
+        if outcome.created {
+            self.config.profiles.push(outcome.profile.clone());
+            self.config.selected = self.config.profiles.len() - 1;
+        } else if let Some(index) = self
+            .config
+            .profiles
+            .iter()
+            .position(|profile| profile.directory == outcome.profile.directory)
+        {
+            self.config.profiles[index] = outcome.profile.clone();
+            self.config.selected = index;
+        } else {
+            self.ai_answer
+                .push_str("\nСборка была удалена из списка. Файлы доступны в её папке.");
+            self.ai_task = None;
+            return;
+        }
+        if let Some(task) = &mut self.ai_task {
+            task.profile = outcome.profile.clone();
+        }
+        if let Some(backup) = outcome.backup {
+            let instance = self
+                .ai_task
+                .as_ref()
+                .map(|task| task.instances.clone())
+                .unwrap_or_else(|| self.config.game_root(&self.root).join("instances"))
+                .join(&outcome.profile.directory);
+            self.ai_backup = Some((backup, instance));
+        }
+        let saved = self.config.save(&self.root);
+        if let Err(error) = saved {
+            self.ai_answer
+                .push_str(&format!("\nНе удалось сохранить настройки: {error:#}"));
+            self.ai_task = None;
+            return;
+        }
+        self.refresh_installed();
+        self.projects.clear();
+        self.searched = false;
+        self.mod_browse.invalidate();
+        self.result(Ok(()), "План ИИ выполнен");
+        let cancelled = self
+            .ai_task
+            .as_ref()
+            .is_some_and(|task| task.cancel.load(std::sync::atomic::Ordering::Relaxed));
+        if outcome.launch && !cancelled {
+            let session = self.next_session;
+            self.start_game(ctx);
+            if self.sessions.iter().any(|item| item.id == session) {
+                if let Some(task) = &mut self.ai_task {
+                    task.session = Some(session);
+                }
+                self.ai_answer.push_str("\nЗапуск игры. Ожидаю результат.");
+            } else {
+                self.ai_task = None;
+                self.ai_answer
+                    .push_str("\nЗапуск требует внимания. Проверьте аккаунт и сообщение лаунчера.");
+            }
+        } else {
+            self.ai_task = None;
+            self.ai_answer.push_str("\nГотово.");
+        }
+    }
+
+    fn retry_ai(&mut self, ctx: &egui::Context, after_game: bool) {
+        let Some(task) = &mut self.ai_task else {
+            return;
+        };
+        if task.cancel.load(std::sync::atomic::Ordering::Relaxed)
+            || !task.auto_repair
+            || task.retries >= task.max_repairs
+            || !self.sessions.is_empty()
+        {
+            self.ai_task = None;
+            self.ai_answer
+                .push_str("\nАвтоисправление остановлено. Доступны журнал и ручной разбор.");
+            return;
+        }
+        task.retries += 1;
+        task.repair_only |= after_game;
+        self.ai_answer.push_str(&format!(
+            "\nПопытка исправления {} из {}.",
+            task.retries, task.max_repairs
+        ));
+        self.request_ai_plan(ctx);
+    }
+
     fn ai_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::ScrollArea::vertical()
             .id_salt("ai_helper")
             .show(ui, |ui| {
-                ui.label("Опишите вылет, баг или проблему запуска");
+                ui.label("Опишите сборку, которую нужно создать, или задачу для текущей сборки.");
+                ui.small("Например: «Создай Fabric 1.21.1 с Sodium, Iris и Jade и запусти».");
+
                 ui.add(
                     egui::TextEdit::multiline(&mut self.ai_question)
                         .desired_rows(2)
                         .desired_width(f32::INFINITY),
                 );
+                ui.small(format!("Запрос, параметры сборки и журналы будут переданы в {}. При включённом автоисправлении после сбоя они отправляются повторно.", self.config.assistant.endpoint));
+                let old_settings = serde_json::to_string(&self.config.assistant).unwrap_or_default();
+                ui.checkbox(&mut self.config.assistant.auto_repair, "Автоматически исправлять сбои ИИ-запуска");
+                ui.add(egui::Slider::new(&mut self.config.assistant.max_repairs, 1..=3).text("Попыток исправления"));
+                if old_settings != serde_json::to_string(&self.config.assistant).unwrap_or_default() {
+                    let result = self.config.save(&self.root);
+                    self.result(result, "");
+                }
+                ui.horizontal_wrapped(|ui| {
+                    let enabled = !self.ai_busy && self.ai_task.is_none() && !self.busy
+                        && self.sessions.is_empty() && !self.content_mutation_busy() && !self.ai_question.trim().is_empty();
+                    if ui.add_enabled(enabled, egui::Button::new("Выполнить запрос")).clicked() {
+                        self.begin_ai_task(ctx, false);
+                    }
+                    if ui.add_enabled(enabled, egui::Button::new("Исправить текущую сборку")).clicked() {
+                        self.begin_ai_task(ctx, true);
+                    }
+                    if let Some(task) = &self.ai_task {
+                        if ui.button("Остановить автоматизацию").clicked() {
+                            task.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                            if !self.ai_busy { self.ai_task = None; }
+                        }
+                    }
+                });
+                if let Some((backup, instance)) = self.ai_backup.clone() {
+                    ui.small("Откат вернёт моды и параметры к состоянию перед последним исправлением.");
+                    if ui.add_enabled(!self.ai_busy && self.ai_task.is_none() && !self.busy
+                        && self.sessions.is_empty() && !self.content_mutation_busy(),
+                        egui::Button::new("Откатить последнее исправление")).clicked()
+                    {
+                        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+                        self.ai_busy = true;
+                        self.busy = true;
+                        std::thread::spawn(move || {
+                            let _ = tx.send(Event::AiUndone(agent::undo(&backup, &instance)));
+                            ctx.request_repaint();
+                        });
+                    }
+                }
+                ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button("Подготовить отчёт").clicked() {
                         self.prepare_ai_report();
@@ -3456,7 +3777,7 @@ impl Launcher {
                     ui.label(format!("Получатель: {}", self.config.assistant.endpoint));
                     if ui
                         .add_enabled(
-                            !self.ai_busy,
+                            !self.ai_busy && self.ai_task.is_none(),
                             egui::Button::new("Подтверждаю отправку — проанализировать"),
                         )
                         .clicked()
@@ -3530,8 +3851,7 @@ impl Launcher {
                         {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                         }
-                        if !variant::LITE
-                            && ui.button("ИИ").on_hover_text("Помощь при вылете").clicked()
+                        if ui.button("ИИ").on_hover_text("Сборки, запуск и исправление ошибок").clicked()
                         {
                             self.toggle_page(Page::Help);
                         }
@@ -3665,6 +3985,9 @@ impl Launcher {
                     0.,
                     Color32::from_black_alpha(self.config.appearance.dim),
                 );
+                if self.config.appearance.interface_style == appearance::InterfaceStyle::LiquidGlass {
+                    self.glass.capture(ui);
+                }
             });
         if background_click {
             self.close_pages();
@@ -3829,6 +4152,12 @@ impl Launcher {
     }
 }
 impl eframe::App for Launcher {
+    fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+        if let Some(gl) = gl {
+            self.glass.destroy(gl);
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         #[cfg(windows)]
         self.tray.bind(_frame);
@@ -3839,6 +4168,8 @@ impl eframe::App for Launcher {
             && self.game_cancel.is_none()
             && !self.busy
             && !self.content_mutation_busy()
+            && self.ai_task.is_none()
+            && !self.ai_busy
             && self.page != Page::BuildEdit
             && self.secondary_page != Some(Page::BuildEdit)
         {
@@ -3991,6 +4322,30 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod ui_tests {
     use super::*;
+    #[test]
+    fn ai_launch_keeps_controller_alive_and_stops_repairing_at_limit() {
+        let ctx = egui::Context::default();
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.on_game_start = model::OnGameStart::Close;
+        let mut app = Launcher::new(&ctx, root.path().into(), config, false, String::new());
+        app.ai_task = Some(agent::Task {
+            request: "Fix".into(),
+            profile: app.config.profiles[0].clone(),
+            instances: root.path().join("instances"),
+            default_java: Default::default(),
+            retries: 1, max_repairs: 1, auto_repair: true,
+            session: Some(42), repair_only: false,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        assert!(matches!(app.on_game_start(), model::OnGameStart::KeepOpen));
+        app.tx.send(Event::Game(42, game::Event::Finished(Err("Test crash".into())))).unwrap();
+        app.process_events(&ctx);
+        assert!(app.ai_task.is_none());
+        assert!(!app.ai_busy);
+        assert!(app.ai_answer.contains("Автоисправление остановлено"));
+    }
+
     #[test]
     #[cfg(feature = "lite")]
     fn lite_idle_does_not_schedule_an_animated_background() {

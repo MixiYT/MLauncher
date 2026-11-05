@@ -1125,6 +1125,7 @@ pub fn run(
 ) -> Result<i32> {
     fs::create_dir_all(&request.instance)?;
     let instance_lock = lock_instance(&request.instance)?;
+    crate::agent::recover(&request.instance)?;
     fs::create_dir_all(&request.storage)?;
     let lock = OpenOptions::new()
         .create(true)

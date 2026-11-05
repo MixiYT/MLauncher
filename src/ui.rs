@@ -94,6 +94,9 @@ pub fn paint_panel(ui: &egui::Ui, rect: Rect) {
                 .as_shape(rect, visuals.window_corner_radius),
         );
     }
+    if crate::appearance::InterfaceStyle::current(ui.ctx()) == crate::appearance::InterfaceStyle::LiquidGlass {
+        crate::glass::panel(ui, rect, visuals.window_corner_radius.nw as f32);
+    }
     paint_surface(
         ui,
         rect,

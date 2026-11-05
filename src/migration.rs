@@ -379,7 +379,7 @@ pub fn import(build: &Build, instances: &Path, cancel: &AtomicBool) -> Result<Pr
     })
 }
 
-fn copy(source: &Path, destination: &Path, cancel: &AtomicBool) -> Result<()> {
+pub(crate) fn copy(source: &Path, destination: &Path, cancel: &AtomicBool) -> Result<()> {
     downloads::check_cancel(cancel)?;
     let metadata = fs::symlink_metadata(source)?;
     #[cfg(windows)]

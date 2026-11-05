@@ -104,6 +104,37 @@ impl Api {
         self.search_filtered(source, query, profile, offset, &SearchOptions::default())
     }
 
+    pub fn modrinth_project(&self, id: &str) -> Result<Project> {
+        anyhow::ensure!(
+            !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'),
+            "Нужен slug или id Modrinth: {id}"
+        );
+        let value = self.get(&format!("{MR}/project/{id}"), &[], Source::Modrinth)?;
+        anyhow::ensure!(
+            value["project_type"] == "mod",
+            "Проект {id} не является модом"
+        );
+        Ok(Project {
+            id: text(&value, "id"),
+            name: text(&value, "title"),
+            description: text(&value, "description"),
+            author: String::new(),
+            downloads: value["downloads"].as_u64().unwrap_or(0),
+            website: format!("https://modrinth.com/mod/{id}"),
+            source: Source::Modrinth,
+            icon_url: text(&value, "icon_url"),
+            categories: value["categories"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|value| value.as_str().map(str::to_owned))
+                .collect(),
+        })
+    }
     pub fn categories(&self, source: Source) -> Result<Vec<Category>> {
         let response = match source {
             Source::Modrinth => self.get(&format!("{MR}/tag/category"), &[], source)?,
