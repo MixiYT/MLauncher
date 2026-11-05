@@ -1,4 +1,4 @@
-param(
+﻿param(
     [switch]$SkipBuild,
     [switch]$Lite
 )
@@ -105,4 +105,9 @@ Write-Host "Built: $zip"
 Write-Host "EXE: $(Join-Path $publish $binaryName)"
 Write-Host "SHA256: $($hash.Hash)"
 Write-Host "EXE size: $([math]::Round((Get-Item $stageExe).Length / 1MB, 2)) MiB"
-Remove-Item -LiteralPath $stage -Recurse -Force
+$resolvedStage = (Resolve-Path -LiteralPath $stage).ProviderPath
+$resolvedTemporaryRoot = [IO.Path]::GetFullPath($temporaryRoot).TrimEnd('\') + '\'
+if (-not $resolvedStage.StartsWith($resolvedTemporaryRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Refusing to remove staging directory outside temporary root: $resolvedStage"
+}
+Remove-Item -LiteralPath $resolvedStage -Recurse -Force

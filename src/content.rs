@@ -71,13 +71,7 @@ impl Content {
         self.thumbnails.set_cache(root.join("icons"));
     }
 
-    pub fn warm(
-        &mut self,
-        ctx: &egui::Context,
-        config: &Config,
-        key: &str,
-        section: Section,
-    ) {
+    pub fn warm(&mut self, ctx: &egui::Context, config: &Config, key: &str, section: Section) {
         self.set_section(section);
         self.mc = config.profiles[config.selected].game_version.clone();
         self.entries = crate::packs::cached_entries(&self.cache_file());

@@ -15,7 +15,7 @@ use std::{
         mpsc::{self, Receiver, Sender, SyncSender},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub fn rgba_image(image: image::DynamicImage, max_width: u32, max_height: u32) -> ColorImage {
@@ -81,6 +81,7 @@ pub struct Background {
     cache: Option<std::path::PathBuf>,
     poster: Option<std::path::PathBuf>,
     poster_saved: bool,
+    throttled: Arc<AtomicBool>,
 }
 impl Background {
     pub fn with_cache(root: &Path) -> Self {
@@ -121,6 +122,7 @@ impl Background {
         let stopped = Arc::new(AtomicBool::new(false));
         let animation = Arc::new(AtomicBool::new(animate));
         let child = Arc::new(Mutex::new(None));
+        let throttled = self.throttled.clone();
         self.worker = Some(Worker {
             cancel,
             stopped: stopped.clone(),
@@ -134,7 +136,9 @@ impl Background {
             let result = if is_video(Path::new(&path)) {
                 #[cfg(not(feature = "lite"))]
                 {
-                    video(&path, &tx, &stop, &stopped, &animation, &child, &ctx)
+                    video(
+                        &path, &tx, &stop, &stopped, &animation, &throttled, &child, &ctx,
+                    )
                 }
                 #[cfg(feature = "lite")]
                 {
@@ -144,7 +148,7 @@ impl Background {
                 .extension()
                 .is_some_and(|e| e.eq_ignore_ascii_case("gif"))
             {
-                gif(&path, &tx, &stop, &stopped, &animation, &ctx)
+                gif(&path, &tx, &stop, &stopped, &animation, &throttled, &ctx)
             } else {
                 still(&path, &tx, &stopped, &ctx)
             };
@@ -161,6 +165,9 @@ impl Background {
                 }
             }
         });
+    }
+    pub fn throttle_signal(&self) -> Arc<AtomicBool> {
+        self.throttled.clone()
     }
     pub fn animate(&self, enabled: bool) {
         if let Some(worker) = &self.worker {
@@ -305,16 +312,10 @@ fn still(
     ctx: &egui::Context,
 ) -> Result<()> {
     let file = File::open(path).context("Не удалось открыть фон")?;
-    if file.metadata()?.len() > 64 * 1024 * 1024 {
-        bail!("Картинка превышает 64 МиБ");
-    }
-    let mut bytes = vec![];
-    file.take(64 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
-    let image = if cfg!(feature = "lite") {
-        decode_image(&bytes, 1280, 720)?
-    } else {
-        decode_image(&bytes, 1920, 1080)?
-    };
+    let mut reader = image::ImageReader::new(BufReader::new(file)).with_guessed_format()?;
+    reader.no_limits();
+    let max = ctx.input(|i| i.max_texture_side) as u32;
+    let image = rgba_image(reader.decode()?, max, max);
     if !stopped.load(Ordering::Relaxed) {
         send_frame(tx, image, ctx);
     }
@@ -352,21 +353,15 @@ fn gif(
     stop: &Receiver<()>,
     stopped: &AtomicBool,
     animation: &AtomicBool,
+    throttled: &AtomicBool,
     ctx: &egui::Context,
 ) -> Result<()> {
+    let mut last_sent = None;
+    let mut deadline = Instant::now();
     loop {
         let file = File::open(path)?;
-        if file.metadata()?.len() > 64 * 1024 * 1024 {
-            bail!("GIF превышает 64 МиБ");
-        }
         let mut decoder = image::codecs::gif::GifDecoder::new(BufReader::new(file))?;
-        let (w, h) = decoder.dimensions();
-        if w > 2048 || h > 2048 {
-            bail!("GIF должен быть не больше 2048×2048");
-        }
-        let mut limits = image::Limits::default();
-        limits.max_alloc = Some(64 * 1024 * 1024);
-        decoder.set_limits(limits)?;
+        decoder.set_limits(image::Limits::no_limits())?;
         let mut count = 0;
         for frame in decoder.into_frames() {
             if stopped.load(Ordering::Relaxed) {
@@ -374,22 +369,31 @@ fn gif(
             }
             let frame = frame?;
             let (n, d) = frame.delay().numer_denom_ms();
-            let delay = Duration::from_millis(
-                (n as u64 / d.max(1) as u64)
-                    .clamp(if cfg!(feature = "lite") { 67 } else { 20 }, 60_000),
-            );
-            send_frame(
-                tx,
-                rgba_image(
-                    image::DynamicImage::ImageRgba8(frame.into_buffer()),
-                    if cfg!(feature = "lite") { 960 } else { 1280 },
-                    if cfg!(feature = "lite") { 540 } else { 720 },
-                ),
-                ctx,
-            );
+            let delay = frame_delay(n, d);
+            if present_frame(throttled, &mut last_sent) {
+                let max = ctx.input(|i| i.max_texture_side) as u32;
+                send_frame(
+                    tx,
+                    rgba_image(
+                        image::DynamicImage::ImageRgba8(frame.into_buffer()),
+                        max,
+                        max,
+                    ),
+                    ctx,
+                );
+            }
             count += 1;
-            if !wait(stop, stopped, animation, delay) {
+            deadline += delay;
+            if !wait(
+                stop,
+                stopped,
+                animation,
+                deadline.saturating_duration_since(Instant::now()),
+            ) {
                 return Ok(());
+            }
+            if deadline.elapsed().as_millis() > 100 {
+                deadline = Instant::now();
             }
         }
         if count == 0 {
@@ -404,6 +408,7 @@ fn video(
     stop: &Receiver<()>,
     stopped: &AtomicBool,
     animation: &AtomicBool,
+    throttled: &AtomicBool,
     slot: &Mutex<Option<Child>>,
     ctx: &egui::Context,
 ) -> Result<()> {
@@ -416,14 +421,11 @@ fn video(
             "-nostdin",
             "-loglevel",
             "error",
-            "-threads",
-            "2",
-            "-filter_threads",
-            "1",
             "-protocol_whitelist",
             "file,pipe",
             "-stream_loop",
             "-1",
+            "-re",
             "-i",
         ])
         .arg(path)
@@ -431,9 +433,16 @@ fn video(
             "-an",
             "-sn",
             "-vf",
-            "fps=24,scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720",
+            &format!(
+                "scale=w=min(iw\\,{0}):h=min(ih\\,{0}):force_original_aspect_ratio=decrease",
+                ctx.input(|i| i.max_texture_side)
+            ),
             "-f",
-            "rawvideo",
+            "image2pipe",
+            "-vcodec",
+            "pam",
+            "-vsync",
+            "0",
             "-pix_fmt",
             "rgba",
             "pipe:1",
@@ -447,7 +456,7 @@ fn video(
         command.creation_flags(0x08000000);
     }
     let mut child=command.spawn().context("Для видео установите FFmpeg и добавьте ffmpeg.exe в PATH. Картинки и GIF работают без FFmpeg")?;
-    let mut stdout = child.stdout.take().context("Не удалось прочитать видео")?;
+    let stdout = child.stdout.take().context("Не удалось прочитать видео")?;
     {
         let mut guard = slot
             .lock()
@@ -459,20 +468,14 @@ fn video(
         }
         *guard = Some(child);
     }
-    let mut frame = vec![0u8; 1280 * 720 * 4];
+    let mut stdout = BufReader::new(stdout);
+    let mut last_sent = None;
     while !stopped.load(Ordering::Relaxed) {
-        if stdout.read_exact(&mut frame).is_err() {
-            if stopped.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-            bail!("FFmpeg не смог воспроизвести видео. Проверьте файл и кодек.");
+        let (size, bytes) = read_pam(&mut stdout, ctx.input(|i| i.max_texture_side))?;
+        if present_frame(throttled, &mut last_sent) {
+            send_frame(tx, ColorImage::from_rgba_unmultiplied(size, &bytes), ctx);
         }
-        send_frame(
-            tx,
-            ColorImage::from_rgba_unmultiplied([1280, 720], &frame),
-            ctx,
-        );
-        if !wait(stop, stopped, animation, Duration::from_millis(42)) {
+        if !wait(stop, stopped, animation, Duration::ZERO) {
             return Ok(());
         }
     }
@@ -657,6 +660,7 @@ pub fn smoke_test(icon_url: &str) -> Result<()> {
         &stop,
         &AtomicBool::new(false),
         &AtomicBool::new(true),
+        &AtomicBool::new(false),
         &egui::Context::default(),
     )?;
     assert!(matches!(
@@ -704,7 +708,7 @@ pub fn smoke_test(icon_url: &str) -> Result<()> {
         );
         let worker = background.worker.as_ref().context("Video worker missing")?;
         match worker.rx.recv_timeout(Duration::from_secs(20))? {
-            MediaEvent::Frame(frame) => assert_eq!(frame.size, [1280, 720]),
+            MediaEvent::Frame(frame) => assert_eq!(frame.size, [64, 64]),
             MediaEvent::Error(e) => bail!("{e}"),
         }
         background.animate(false);
@@ -808,6 +812,7 @@ mod tests {
             &stop,
             &AtomicBool::new(false),
             &AtomicBool::new(true),
+            &AtomicBool::new(false),
             &egui::Context::default(),
         )
         .unwrap();
@@ -823,6 +828,109 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(rx.try_recv(), Ok(MediaEvent::Frame(_))));
+    }
+    #[test]
+    fn wallpaper_keeps_native_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wide.png");
+        image::RgbaImage::new(2560, 32).save(&path).unwrap();
+        let (tx, rx) = mpsc::sync_channel(1);
+        let ctx = egui::Context::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                max_texture_side: Some(8192),
+                ..Default::default()
+            },
+            |_| {},
+        );
+        still(path.to_str().unwrap(), &tx, &AtomicBool::new(false), &ctx).unwrap();
+        let MediaEvent::Frame(frame) = rx.try_recv().unwrap() else {
+            panic!("missing frame")
+        };
+        assert_eq!(frame.size, [2560, 32]);
+    }
+    #[test]
+    fn source_timing_and_background_presentation() {
+        assert_eq!(frame_delay(10, 1), Duration::from_millis(10));
+        assert!((frame_delay(1000, 144).as_secs_f64() - 1. / 144.).abs() < 0.000001);
+        let throttled = AtomicBool::new(true);
+        let mut last = None;
+        assert!(present_frame(&throttled, &mut last));
+        assert!(!present_frame(&throttled, &mut last));
+        throttled.store(false, Ordering::Relaxed);
+        assert!(present_frame(&throttled, &mut last));
+    }
+    #[test]
+    #[cfg(not(feature = "lite"))]
+    fn pam_frames_preserve_size_and_validate_input() {
+        let mut bytes =
+            b"P7\nWIDTH 2\nHEIGHT 1\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n".to_vec();
+        bytes.extend_from_slice(&[255, 0, 0, 255, 0, 255, 0, 255]);
+        let (size, pixels) = read_pam(&mut std::io::Cursor::new(&bytes), 8192).unwrap();
+        assert_eq!(size, [2, 1]);
+        assert_eq!(pixels.len(), 8);
+        assert!(read_pam(&mut std::io::Cursor::new(&bytes), 1).is_err());
+        assert!(read_pam(&mut std::io::Cursor::new(b"broken\n"), 8192).is_err());
+    }
+    #[test]
+    #[cfg(not(feature = "lite"))]
+    fn ffmpeg_preserves_native_frames_and_high_frame_rate() {
+        if Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_err()
+        {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("120fps.mp4");
+        let output = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:s=256x144:r=120",
+                "-t",
+                "1",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut bg = Background::default();
+        bg.load(path.to_str().unwrap(), true, &egui::Context::default());
+        let rx = &bg.worker.as_ref().unwrap().rx;
+        let first = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let MediaEvent::Frame(frame) = first else {
+            if let MediaEvent::Error(e) = first {
+                panic!("{e}")
+            } else {
+                unreachable!()
+            }
+        };
+        assert_eq!(frame.size, [256, 144]);
+        let start = Instant::now();
+        for _ in 0..24 {
+            assert!(matches!(
+                rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+                MediaEvent::Frame(_)
+            ));
+        }
+        assert!(
+            start.elapsed() < Duration::from_millis(700),
+            "Video is capped below its source rate"
+        );
     }
     #[test]
     fn gif_can_pause_resume_and_cancel() {
@@ -857,4 +965,63 @@ mod tests {
         ));
         drop(background);
     }
+}
+fn frame_delay(n: u32, d: u32) -> Duration {
+    Duration::from_secs_f64((n as f64 / d.max(1) as f64 / 1000.).max(0.001))
+}
+fn present_frame(throttled: &AtomicBool, last: &mut Option<Instant>) -> bool {
+    if throttled.load(Ordering::Relaxed)
+        && last.is_some_and(|t| t.elapsed() < Duration::from_secs_f64(1. / 30.))
+    {
+        return false;
+    }
+    *last = Some(Instant::now());
+    true
+}
+/// PAM preserves source dimensions without requiring a second ffprobe executable.
+#[cfg(not(feature = "lite"))]
+fn read_pam(reader: &mut impl std::io::BufRead, max_side: usize) -> Result<([usize; 2], Vec<u8>)> {
+    use std::io::BufRead;
+    let mut width = 0usize;
+    let mut height = 0usize;
+    let mut depth = 0usize;
+    let mut maxval = 0usize;
+    let mut header = 0usize;
+    loop {
+        let mut line = String::new();
+        // Limit individual header lines as well as the total header before allocating pixels.
+        let n = reader.take(4097).read_line(&mut line)?;
+        header += n;
+        anyhow::ensure!(n > 0 && header <= 4096, "Invalid video frame header");
+        if header == n {
+            anyhow::ensure!(line.trim() == "P7", "Invalid video frame signature");
+        }
+        let mut fields = line.split_whitespace();
+        match fields.next() {
+            Some("P7") if header == n => {}
+            Some("WIDTH") => width = fields.next().unwrap_or("").parse()?,
+            Some("HEIGHT") => height = fields.next().unwrap_or("").parse()?,
+            Some("DEPTH") => depth = fields.next().unwrap_or("").parse()?,
+            Some("MAXVAL") => maxval = fields.next().unwrap_or("").parse()?,
+            Some("ENDHDR") => break,
+            Some("TUPLTYPE") | Some("#") | None => {}
+            _ => bail!("Invalid video frame header"),
+        }
+    }
+    anyhow::ensure!(
+        width > 0
+            && height > 0
+            && width <= max_side
+            && height <= max_side
+            && depth == 4
+            && maxval == 255,
+        "Unsupported video frame dimensions or format"
+    );
+    let len = width
+        .checked_mul(height)
+        .and_then(|n| n.checked_mul(4))
+        .context("Video frame too large")?;
+    let mut bytes = vec![0; len];
+    reader.read_exact(&mut bytes)?;
+    Ok(([width, height], bytes))
 }

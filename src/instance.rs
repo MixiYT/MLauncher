@@ -152,8 +152,7 @@ impl Editor {
         });
         ui.horizontal_wrapped(|ui| {
             for tab in Tab::ALL {
-                if ui::tab_value(ui, &mut self.tab, tab, tab.label()).changed()
-                {
+                if ui::tab_value(ui, &mut self.tab, tab, tab.label()).changed() {
                     self.refresh = true;
                     self.rename = None;
                     self.remove = None;

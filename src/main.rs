@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-mod api;
 mod agent;
+mod api;
 mod appearance;
 mod assistant;
 mod auth;
@@ -21,6 +21,7 @@ mod microsoft;
 mod migration;
 mod model;
 mod overlay;
+mod pacing;
 mod packs;
 mod scenery;
 mod secrets;
@@ -159,6 +160,7 @@ struct Launcher {
     category_error: String,
     thumbnails: media::Thumbnails,
     background: media::Background,
+    pacing: pacing::Pacing,
     applied_appearance: appearance::Appearance,
     settings_tab: SettingsTab,
     background_path_input: String,
@@ -203,6 +205,7 @@ struct PanelMotion {
     from_alpha: f32,
     to_alpha: f32,
     started: f64,
+    velocity: [f32; 5],
 }
 impl PanelMotion {
     fn new(page: Page, rect: egui::Rect, now: f64, fade: bool) -> Self {
@@ -213,18 +216,45 @@ impl PanelMotion {
             from_alpha: if fade { 0. } else { 1. },
             to_alpha: 1.,
             started: now,
+            velocity: [0.; 5],
         }
     }
-    fn sample(self, now: f64) -> (egui::Rect, f32) {
-        let phase = ((now - self.started) / 0.20).clamp(0., 1.) as f32;
-        let eased = 1. - (1. - phase).powi(3);
+    fn state(self, now: f64) -> ([f32; 5], [f32; 5]) {
+        let t = ((now - self.started) / 0.24).clamp(0., 1.) as f32;
+        let eased = t.powi(3) * (t * (t * 6. - 15.) + 10.);
+        let carry = t - 6. * t.powi(3) + 8. * t.powi(4) - 3. * t.powi(5);
+        let slope = 30. * t.powi(2) * (t - 1.).powi(2) / 0.24;
+        let carry_slope = 1. - 18. * t.powi(2) + 32. * t.powi(3) - 15. * t.powi(4);
+        let from = [
+            self.from_rect.min.x,
+            self.from_rect.min.y,
+            self.from_rect.max.x,
+            self.from_rect.max.y,
+            self.from_alpha,
+        ];
+        let to = [
+            self.to_rect.min.x,
+            self.to_rect.min.y,
+            self.to_rect.max.x,
+            self.to_rect.max.y,
+            self.to_alpha,
+        ];
         (
-            self.from_rect.lerp_towards(&self.to_rect, eased),
-            egui::lerp(self.from_alpha..=self.to_alpha, eased),
+            std::array::from_fn(|i| {
+                from[i] + (to[i] - from[i]) * eased + self.velocity[i] * 0.24 * carry
+            }),
+            std::array::from_fn(|i| (to[i] - from[i]) * slope + self.velocity[i] * carry_slope),
+        )
+    }
+    fn sample(self, now: f64) -> (egui::Rect, f32) {
+        let (v, _) = self.state(now);
+        (
+            egui::Rect::from_min_max(egui::pos2(v[0], v[1]), egui::pos2(v[2], v[3])),
+            v[4].clamp(0., 1.),
         )
     }
     fn active(self, now: f64) -> bool {
-        now - self.started < 0.20
+        now - self.started < 0.24
     }
     fn target(&mut self, rect: egui::Rect, alpha: f32, now: f64, animate: bool) {
         if !animate {
@@ -233,8 +263,14 @@ impl PanelMotion {
             self.from_alpha = alpha;
             self.to_alpha = alpha;
             self.started = now - 1.;
+            self.velocity = [0.; 5];
         } else if self.to_rect != rect || self.to_alpha != alpha {
+            let (_, velocity) = self.state(now);
             (self.from_rect, self.from_alpha) = self.sample(now);
+            self.velocity = velocity;
+            if self.from_alpha <= 0. || self.from_alpha >= 1. {
+                self.velocity[4] = 0.;
+            }
             self.to_rect = rect;
             self.to_alpha = alpha;
             self.started = now;
@@ -270,12 +306,15 @@ impl Launcher {
         let background_path_input = config.appearance.background.clone();
         let (ai_key, cf_key) = secrets::load_api_keys(&root);
         let cache_root = if start_workers {
-            std::env::current_exe().ok()
+            std::env::current_exe()
+                .ok()
                 .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
                 .unwrap_or_else(|| root.clone())
         } else {
             root.clone()
-        }.join("MLauncher-cache").join(if variant::LITE { "lite" } else { "full" });
+        }
+        .join("MLauncher-cache")
+        .join(if variant::LITE { "lite" } else { "full" });
         let background = media::Background::with_cache(&cache_root);
         let brand = media::decode_image(icons::bytes(), 32, 32)
             .ok()
@@ -343,6 +382,7 @@ impl Launcher {
             category_error: String::new(),
             thumbnails: Default::default(),
             background,
+            pacing: Default::default(),
             applied_appearance,
             settings_tab: SettingsTab::Appearance,
             background_path_input,
@@ -394,18 +434,10 @@ impl Launcher {
             app.content.set_cache(&app.cache_root);
             app.resource_catalog.set_cache(&app.cache_root);
             if !variant::LITE {
-                app.content.warm(
-                    ctx,
-                    &app.config,
-                    &app.key,
-                    content::Section::Packs,
-                );
-                app.resource_catalog.warm(
-                    ctx,
-                    &app.config,
-                    &app.key,
-                    content::Section::Resources,
-                );
+                app.content
+                    .warm(ctx, &app.config, &app.key, content::Section::Packs);
+                app.resource_catalog
+                    .warm(ctx, &app.config, &app.key, content::Section::Resources);
             }
             app.thumbnails.set_cache(app.cache_root.join("icons"));
             app.load_versions(ctx);
@@ -1044,7 +1076,10 @@ impl Launcher {
                     self.install_update_pending = matches!(&result, Ok(Some(_)));
                     if let Ok(Some(update)) = &result {
                         if !self.busy && !self.error && self.status.is_empty() {
-                            self.status = format!("Обновление {} скачано. Архив доступен в настройках.", update.version);
+                            self.status = format!(
+                                "Обновление {} скачано. Архив доступен в настройках.",
+                                update.version
+                            );
                         }
                     }
                     self.launcher_update = Some(result);
@@ -1052,7 +1087,9 @@ impl Launcher {
                 Event::AiPlan(result) => self.apply_ai_plan(result, ctx),
                 Event::AiApplied(result) => self.finish_ai_action(result, ctx),
                 Event::AiUndone(result) => {
-                    if result.is_ok() { self.ai_backup = None; }
+                    if result.is_ok() {
+                        self.ai_backup = None;
+                    }
                     self.finish_ai_action(result, ctx);
                 }
                 Event::Analysis(result) => {
@@ -1109,7 +1146,10 @@ impl Launcher {
                     }
                     game::Event::Finished(result) => {
                         let ai_failed = !matches!(&result, Ok(0));
-                        let ai_owned = self.ai_task.as_ref().is_some_and(|task| task.session == Some(id));
+                        let ai_owned = self
+                            .ai_task
+                            .as_ref()
+                            .is_some_and(|task| task.session == Some(id));
                         let cancelled =
                             self.sessions.iter().find(|s| s.id == id).is_some_and(|s| {
                                 s.cancel.load(std::sync::atomic::Ordering::Relaxed)
@@ -1685,11 +1725,16 @@ impl Launcher {
                         if !self.cache_root.try_exists()? {
                             return Ok(());
                         }
-                        let expected = base.parent().unwrap().canonicalize()?
+                        let expected = base
+                            .parent()
+                            .unwrap()
+                            .canonicalize()?
                             .join(base.file_name().unwrap())
                             .join(self.cache_root.file_name().unwrap());
-                        anyhow::ensure!(self.cache_root.canonicalize()? == expected,
-                            "Путь кеша перенаправлен");
+                        anyhow::ensure!(
+                            self.cache_root.canonicalize()? == expected,
+                            "Путь кеша перенаправлен"
+                        );
                         std::fs::remove_dir_all(&self.cache_root)?;
                         Ok(())
                     })();
@@ -1925,7 +1970,12 @@ impl Launcher {
         let previous = self.config.appearance.interface_style;
         ui.horizontal_wrapped(|ui| {
             for style in appearance::InterfaceStyle::ALL {
-                ui::tab_value(ui, &mut self.config.appearance.interface_style, style, style.label());
+                ui::tab_value(
+                    ui,
+                    &mut self.config.appearance.interface_style,
+                    style,
+                    style.label(),
+                );
             }
         });
         if previous != self.config.appearance.interface_style {
@@ -2577,7 +2627,12 @@ impl Launcher {
                         "Мои сборки",
                         "Управление установленными сборками",
                     ),
-                    (VersionTab::Packs, Icon::Builds, "Скачать сборку", "Каталог сборок"),
+                    (
+                        VersionTab::Packs,
+                        Icon::Builds,
+                        "Скачать сборку",
+                        "Каталог сборок",
+                    ),
                     (
                         VersionTab::Exchange,
                         Icon::Exchange,
@@ -2982,7 +3037,9 @@ impl Launcher {
                                     ui.add(
                                         egui::Image::new(texture)
                                             .fit_to_exact_size(Vec2::splat(42.))
-                                            .corner_radius(ui.visuals().widgets.inactive.corner_radius),
+                                            .corner_radius(
+                                                ui.visuals().widgets.inactive.corner_radius,
+                                            ),
                                     );
                                 } else {
                                     let rect = ui
@@ -3366,7 +3423,8 @@ impl Drop for Launcher {
     fn drop(&mut self) {
         self.persist_layout();
         if let Some(task) = &self.ai_task {
-            task.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            task.cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
         use zeroize::Zeroize;
         self.account_password.zeroize();
@@ -3851,7 +3909,10 @@ impl Launcher {
                         {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                         }
-                        if ui.button("ИИ").on_hover_text("Сборки, запуск и исправление ошибок").clicked()
+                        if ui
+                            .button("ИИ")
+                            .on_hover_text("Сборки, запуск и исправление ошибок")
+                            .clicked()
                         {
                             self.toggle_page(Page::Help);
                         }
@@ -3934,7 +3995,8 @@ impl Launcher {
             self.changed_instance();
         }
         self.resource_catalog.drain(ctx);
-        self.avatars.refresh(&self.config.accounts, &self.cache_root, ctx);
+        self.avatars
+            .refresh(&self.config.accounts, &self.cache_root, ctx);
         self.avatars.drain(ctx);
         self.thumbnails.drain(ctx);
         self.title_bar(ctx);
@@ -3985,7 +4047,8 @@ impl Launcher {
                     0.,
                     Color32::from_black_alpha(self.config.appearance.dim),
                 );
-                if self.config.appearance.interface_style == appearance::InterfaceStyle::LiquidGlass {
+                if self.config.appearance.interface_style == appearance::InterfaceStyle::LiquidGlass
+                {
                     self.glass.capture(ui);
                 }
             });
@@ -3996,7 +4059,7 @@ impl Launcher {
             && !custom_background
             && (!variant::LITE || !matches!(self.config.appearance.effect, effects::Effect::None))
         {
-            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            ctx.request_repaint();
         }
         let screen = egui::Rect::from_min_max(
             ctx.screen_rect().min + Vec2::new(0., 38.),
@@ -4158,9 +4221,14 @@ impl eframe::App for Launcher {
         }
     }
 
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
+        input.predicted_dt = self.pacing.predicted_dt();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         #[cfg(windows)]
         self.tray.bind(_frame);
+        self.pacing.begin(_frame, self.background.throttle_signal());
         self.render(ctx);
         #[cfg(windows)]
         if self.install_update_pending
@@ -4179,7 +4247,8 @@ impl eframe::App for Launcher {
                     Ok(true) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                     Ok(false) => {}
                     Err(error) => self.result(
-                        Err(error.context("Автоустановка не запустилась. Архив доступен в настройках")),
+                        Err(error
+                            .context("Автоустановка не запустилась. Архив доступен в настройках")),
                         "",
                     ),
                 }
@@ -4300,6 +4369,7 @@ fn main() -> anyhow::Result<()> {
     }
     let options = eframe::NativeOptions {
         viewport,
+        vsync: true,
         ..Default::default()
     };
     let title = format!("{} {}", variant::NAME, env!("CARGO_PKG_VERSION"));
@@ -4334,12 +4404,20 @@ mod ui_tests {
             profile: app.config.profiles[0].clone(),
             instances: root.path().join("instances"),
             default_java: Default::default(),
-            retries: 1, max_repairs: 1, auto_repair: true,
-            session: Some(42), repair_only: false,
+            retries: 1,
+            max_repairs: 1,
+            auto_repair: true,
+            session: Some(42),
+            repair_only: false,
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
         assert!(matches!(app.on_game_start(), model::OnGameStart::KeepOpen));
-        app.tx.send(Event::Game(42, game::Event::Finished(Err("Test crash".into())))).unwrap();
+        app.tx
+            .send(Event::Game(
+                42,
+                game::Event::Finished(Err("Test crash".into())),
+            ))
+            .unwrap();
         app.process_events(&ctx);
         assert!(app.ai_task.is_none());
         assert!(!app.ai_busy);
@@ -4449,6 +4527,25 @@ mod ui_tests {
             let (inner, used) = layout::content_bounds(&ctx, layout::PanelId::Versions).unwrap();
             assert!(used.right() <= inner.right() + 1.);
             assert!(used.bottom() <= inner.bottom() + 1.);
+        }
+    }
+    #[test]
+    fn animation_retarget_keeps_velocity_and_is_independent_of_refresh_rate() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300., 500.));
+        let mut motion = PanelMotion::new(Page::Settings, rect, 0., true);
+        let (before, velocity) = motion.state(0.09);
+        motion.target(rect.translate(egui::vec2(100., 0.)), 0., 0.09, true);
+        let (after, after_velocity) = motion.state(0.09);
+        for i in 0..5 {
+            assert!((before[i] - after[i]).abs() < 0.0001);
+            assert!((velocity[i] - after_velocity[i]).abs() < 0.0001);
+        }
+        for hz in [60., 144., 240.] {
+            for step in 0..(hz as usize) {
+                let _ = motion.sample(step as f64 / hz);
+            }
+            assert_eq!(motion.sample(1.).0, rect.translate(egui::vec2(100., 0.)));
+            assert_eq!(motion.sample(1.).1, 0.);
         }
     }
     #[test]
