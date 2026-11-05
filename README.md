@@ -11,6 +11,7 @@
 ### Главный экран
 
 ![Главный экран MLauncher](docs/screenshots/home.png)
+P.S.Скрины сделал chatgpt :)
 
 ### Моды и ресурспаки
 
