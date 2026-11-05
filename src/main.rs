@@ -16,6 +16,7 @@ mod layout;
 mod manual;
 mod media;
 mod microsoft;
+mod migration;
 mod model;
 mod overlay;
 mod packs;
@@ -77,6 +78,8 @@ impl VersionTab {
 }
 
 enum Event {
+    BuildsFound(Vec<migration::Build>),
+    BuildImported(anyhow::Result<Profile>),
     LauncherUpdate(anyhow::Result<Option<updater::Ready>>),
     Search(u64, usize, anyhow::Result<(String, Vec<Project>)>),
     Progress(String),
@@ -103,6 +106,8 @@ struct Launcher {
     install_update_pending: bool,
     sessions: Vec<GameSession>,
     next_session: u64,
+    discovered_builds: Vec<migration::Build>,
+    scanning_builds: bool,
     root: PathBuf,
     cache_root: PathBuf,
     config: Config,
@@ -282,6 +287,8 @@ impl Launcher {
             install_update_pending: false,
             sessions: vec![],
             next_session: 1,
+            discovered_builds: Vec::new(),
+            scanning_builds: false,
             root,
             cache_root,
             config,
@@ -368,6 +375,7 @@ impl Launcher {
         }
         app.refresh_installed();
         if start_workers {
+            app.scan_builds(ctx, None);
             if cfg!(all(windows, target_arch = "x86_64")) {
                 app.check_launcher_update(ctx);
             }
@@ -1000,6 +1008,25 @@ impl Launcher {
         }
         while let Ok(event) = self.rx.try_recv() {
             match event {
+                Event::BuildsFound(builds) => {
+                    self.scanning_builds = false;
+                    self.discovered_builds = builds;
+                }
+                Event::BuildImported(result) => {
+                    self.busy = false;
+                    self.mod_cancel = None;
+                    match result {
+                        Ok(profile) => {
+                            self.config.profiles.push(profile);
+                            self.config.selected = self.config.profiles.len() - 1;
+                            self.changed_instance();
+                            if !self.error {
+                                self.result(Ok(()), "Сборка перенесена в MLauncher");
+                            }
+                        }
+                        Err(error) => self.result(Err(error), ""),
+                    }
+                }
                 Event::LauncherUpdate(result) => {
                     self.checking_launcher_update = false;
                     self.install_update_pending = matches!(&result, Ok(Some(_)));
@@ -2241,7 +2268,86 @@ impl Launcher {
         self.build_editor = Some(editor);
     }
 
-    fn my_builds(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+    fn scan_builds(&mut self, ctx: &egui::Context, directory: Option<PathBuf>) {
+        self.scanning_builds = true;
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let builds = migration::scan(directory);
+            let _ = tx.send(Event::BuildsFound(builds));
+            ctx.request_repaint();
+        });
+    }
+
+    fn discovered_builds(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        egui::CollapsingHeader::new(format!(
+            "Перенос из других лаунчеров · {}",
+            self.discovered_builds.len()
+        ))
+        .id_salt("discovered_builds")
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if ui.add_enabled(!self.scanning_builds, egui::Button::new("Найти на дисках")).clicked() {
+                    self.scan_builds(ctx, None);
+                }
+                if ui.add_enabled(!self.scanning_builds, egui::Button::new("Выбрать папку…")).clicked() {
+                    if let Some(directory) = rfd::FileDialog::new().pick_folder() {
+                        self.scan_builds(ctx, Some(directory));
+                    }
+                }
+                if self.scanning_builds {
+                    ui.spinner();
+                    ui.label("Поиск сборок…");
+                }
+            });
+            ui.label("Автопоиск проверяет до 60 000 папок на локальных дисках, до 6 уровней вглубь. Для других расположений выберите папку.");
+            ui.small("Перед переносом закройте игру в исходном лаунчере. Моды, настройки, миры и скриншоты будут скопированы.");
+            let blocked = self.busy || self.content_mutation_busy() || self.game_cancel.is_some() || !self.sessions.is_empty();
+            let mut transfer = None;
+            egui::ScrollArea::vertical()
+                .id_salt("discovered_builds_list")
+                .max_height(208.)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for (index, build) in self.discovered_builds.iter().enumerate() {
+                        ui.push_id(index, |ui| {
+                            ui.group(|ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    ui.add(egui::Label::new(egui::RichText::new(&build.name).strong()).truncate());
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.add_enabled(!blocked, egui::Button::new("Перенести")).clicked() {
+                                            transfer = Some(build.clone());
+                                        }
+                                    });
+                                });
+                                ui.small(format!("{} · {} · {}", build.origin, build.minecraft, build.loader));
+                                ui.add(egui::Label::new(build.source.display().to_string()).truncate())
+                                    .on_hover_text(build.source.display().to_string());
+                            });
+                        });
+                    }
+                    if self.discovered_builds.is_empty() && !self.scanning_builds {
+                        ui.label("Распознаваемых сборок пока нет. Выберите папку лаунчера или его instances.");
+                    }
+                });
+            if let Some(build) = transfer {
+                self.busy = true;
+                self.status = format!("Перенос сборки {}…", build.name);
+                self.error = false;
+                let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                self.mod_cancel = Some(cancel.clone());
+                let instances = self.config.game_root(&self.root).join("instances");
+                let (tx, ctx) = (self.tx.clone(), ctx.clone());
+                std::thread::spawn(move || {
+                    let result = migration::import(&build, &instances, &cancel);
+                    let _ = tx.send(Event::BuildImported(result));
+                    ctx.request_repaint();
+                });
+            }
+        });
+    }
+
+    fn my_builds(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut select = None;
         let mut start_edit = None;
         let mut open_editor = None;
@@ -2266,6 +2372,7 @@ impl Launcher {
             ui.label(RichText::new(format!("Всего: {}", self.config.profiles.len())).small());
         });
         ui.separator();
+        self.discovered_builds(ui, ctx);
         let selected = self.config.selected;
         let count = self.config.profiles.len();
         egui::ScrollArea::vertical()
