@@ -20,10 +20,43 @@ impl Theme {
         }
     }
 }
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InterfaceStyle {
+    #[default]
+    Standard,
+    Material,
+    LiquidGlass,
+    Simple,
+}
+
+impl InterfaceStyle {
+    pub const ALL: [Self; 4] = [
+        Self::Standard,
+        Self::Material,
+        Self::LiquidGlass,
+        Self::Simple,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Standard => "Стандартный",
+            Self::Material => "Material",
+            Self::LiquidGlass => "Liquid Glass",
+            Self::Simple => "Simple",
+        }
+    }
+
+    pub fn current(ctx: &egui::Context) -> Self {
+        ctx.data(|data| data.get_temp(egui::Id::new("interface_style")))
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Appearance {
     pub theme: Theme,
+    pub interface_style: InterfaceStyle,
     pub accent: [u8; 3],
     pub animate: bool,
     pub background: String,
@@ -37,6 +70,7 @@ impl Default for Appearance {
     fn default() -> Self {
         Self {
             theme: Theme::Legacy,
+            interface_style: InterfaceStyle::Standard,
             accent: [120, 186, 170],
             animate: true,
             background: String::new(),
@@ -105,6 +139,129 @@ impl Appearance {
         }
         style.spacing.item_spacing = Vec2::new(5., 6.);
         style.spacing.button_padding = Vec2::new(10., 6.);
+        let text = style.visuals.text_color();
+        let border = if light {
+            Color32::from_gray(180)
+        } else {
+            Color32::from_gray(76)
+        };
+        match self.interface_style {
+            InterfaceStyle::Standard => {}
+            InterfaceStyle::Material => {
+                style.visuals.panel_fill =
+                    Color32::from_rgb(panel[0], panel[1], panel[2]).lerp_to_gamma(accent, 0.06);
+                style.visuals.window_fill = style.visuals.panel_fill;
+                style.visuals.window_stroke = Stroke::NONE;
+                style.visuals.window_corner_radius = 18.into();
+                style.visuals.window_shadow = egui::epaint::Shadow {
+                    offset: [0, 6],
+                    blur: 20,
+                    spread: 0,
+                    color: Color32::from_black_alpha(if light { 35 } else { 70 }),
+                };
+                for widget in [
+                    &mut style.visuals.widgets.inactive,
+                    &mut style.visuals.widgets.hovered,
+                    &mut style.visuals.widgets.active,
+                    &mut style.visuals.widgets.open,
+                ] {
+                    widget.corner_radius = 12.into();
+                    widget.bg_stroke = Stroke::NONE;
+                }
+                style.visuals.widgets.inactive.bg_fill =
+                    style.visuals.panel_fill.lerp_to_gamma(accent, 0.12);
+                style.visuals.widgets.inactive.weak_bg_fill =
+                    style.visuals.widgets.inactive.bg_fill;
+                style.visuals.widgets.noninteractive.corner_radius = 12.into();
+                style.visuals.widgets.noninteractive.bg_stroke =
+                    Stroke::new(1_f32, border.gamma_multiply(0.35));
+                style.spacing.button_padding = Vec2::new(12., 6.);
+            }
+            InterfaceStyle::LiquidGlass => {
+                let alpha = self.panel_opacity.clamp(170, 225);
+                let glass = if light { [230, 240, 250] } else { [25, 40, 58] };
+                style.visuals.panel_fill =
+                    Color32::from_rgba_unmultiplied(glass[0], glass[1], glass[2], alpha);
+                style.visuals.window_fill = style.visuals.panel_fill;
+                style.visuals.window_stroke = Stroke::new(
+                    1_f32,
+                    Color32::from_white_alpha(if light { 150 } else { 48 }),
+                );
+                style.visuals.window_corner_radius = 20.into();
+                style.visuals.window_shadow = egui::epaint::Shadow {
+                    offset: [0, 6],
+                    blur: 24,
+                    spread: 1,
+                    color: Color32::from_black_alpha(70),
+                };
+                let surface = Color32::from_rgba_unmultiplied(glass[0], glass[1], glass[2], 210);
+                for widget in [
+                    &mut style.visuals.widgets.inactive,
+                    &mut style.visuals.widgets.hovered,
+                    &mut style.visuals.widgets.active,
+                    &mut style.visuals.widgets.open,
+                ] {
+                    widget.corner_radius = 14.into();
+                    widget.bg_stroke = Stroke::new(
+                        1_f32,
+                        Color32::from_white_alpha(if light { 125 } else { 28 }),
+                    );
+                }
+                style.visuals.widgets.inactive.bg_fill = surface;
+                style.visuals.widgets.inactive.weak_bg_fill = surface;
+                style.visuals.widgets.hovered.bg_fill = surface.lerp_to_gamma(accent, 0.25);
+                style.visuals.widgets.active.bg_fill = surface.lerp_to_gamma(accent, 0.4);
+                style.visuals.widgets.noninteractive.corner_radius = 14.into();
+                style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(
+                    1_f32,
+                    Color32::from_white_alpha(if light { 80 } else { 20 }),
+                );
+            }
+            InterfaceStyle::Simple => {
+                style.visuals.panel_fill = Color32::from_rgb(panel[0], panel[1], panel[2]);
+                style.visuals.window_fill = style.visuals.panel_fill;
+                style.visuals.window_stroke = Stroke::new(1_f32, border);
+                style.visuals.window_corner_radius = 2.into();
+                style.visuals.window_shadow = egui::epaint::Shadow::NONE;
+                style.visuals.popup_shadow = egui::epaint::Shadow::NONE;
+                for widget in [
+                    &mut style.visuals.widgets.inactive,
+                    &mut style.visuals.widgets.hovered,
+                    &mut style.visuals.widgets.active,
+                    &mut style.visuals.widgets.open,
+                ] {
+                    widget.corner_radius = 2.into();
+                    widget.bg_stroke = Stroke::new(1_f32, border);
+                }
+                style.visuals.widgets.noninteractive.corner_radius = 2.into();
+                style.visuals.widgets.noninteractive.bg_stroke =
+                    Stroke::new(1_f32, border.gamma_multiply(0.5));
+                style.spacing.button_padding = Vec2::new(8., 5.);
+            }
+        }
+        if self.interface_style != InterfaceStyle::Standard {
+            style.visuals.menu_corner_radius = style.visuals.widgets.inactive.corner_radius;
+            style.visuals.widgets.noninteractive.bg_fill = style.visuals.window_fill;
+            style.visuals.slider_trailing_fill = self.interface_style == InterfaceStyle::Material;
+            style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.5_f32, text);
+            style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.5_f32, text);
+            style.visuals.widgets.active.fg_stroke = Stroke::new(1.5_f32, text);
+            style.visuals.widgets.open.fg_stroke = Stroke::new(1.5_f32, text);
+            style.visuals.selection.bg_fill = style
+                .visuals
+                .window_fill
+                .to_opaque()
+                .lerp_to_gamma(accent, if light { 0.35 } else { 0.3 });
+            style.visuals.selection.stroke = Stroke::new(1_f32, text);
+            style.visuals.extreme_bg_color = style.visuals.window_fill.to_opaque();
+            style.visuals.faint_bg_color = style.visuals.widgets.inactive.bg_fill;
+            if self.interface_style != InterfaceStyle::Simple {
+                style.visuals.popup_shadow = style.visuals.window_shadow;
+            }
+        }
+        ctx.data_mut(|data| {
+            data.insert_temp(egui::Id::new("interface_style"), self.interface_style)
+        });
         ctx.set_style(style);
     }
 }
@@ -116,8 +273,10 @@ mod tests {
     fn appearance_roundtrip_and_old_defaults() {
         let old: Appearance = serde_json::from_str("{}").unwrap();
         assert_eq!(old.accent, [120, 186, 170]);
+        assert_eq!(old.interface_style, InterfaceStyle::Standard);
         let expected = Appearance {
             theme: Theme::Light,
+            interface_style: InterfaceStyle::Material,
             background: "C:/wallpaper.gif".into(),
             accent: [255, 120, 20],
             ..Default::default()
@@ -126,11 +285,26 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&expected).unwrap()).unwrap();
         assert!(actual == expected);
         for theme in Theme::ALL {
-            Appearance {
-                theme,
-                ..Default::default()
+            for interface_style in InterfaceStyle::ALL {
+                let ctx = egui::Context::default();
+                Appearance {
+                    theme,
+                    interface_style,
+                    ..Default::default()
+                }
+                .apply(&ctx);
+                assert_eq!(InterfaceStyle::current(&ctx), interface_style);
+                let style = ctx.style();
+                assert!(style.visuals.panel_fill.a() >= 140);
+                let encoded = serde_json::to_string(&Appearance {
+                    theme,
+                    interface_style,
+                    ..Default::default()
+                })
+                .unwrap();
+                let decoded: Appearance = serde_json::from_str(&encoded).unwrap();
+                assert_eq!(decoded.interface_style, interface_style);
             }
-            .apply(&egui::Context::default());
         }
     }
 }

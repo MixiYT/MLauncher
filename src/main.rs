@@ -1582,7 +1582,7 @@ impl Launcher {
                 (SettingsTab::Services, "Сервисы"),
                 (SettingsTab::Launcher, "Лаунчер"),
             ] {
-                ui.selectable_value(&mut self.settings_tab, tab, label);
+                ui::tab_value(ui, &mut self.settings_tab, tab, label);
             }
         });
         ui.separator();
@@ -1890,11 +1890,23 @@ impl Launcher {
     }
 
     fn appearance_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.strong("Стиль интерфейса");
+        let previous = self.config.appearance.interface_style;
+        ui.horizontal_wrapped(|ui| {
+            for style in appearance::InterfaceStyle::ALL {
+                ui::tab_value(ui, &mut self.config.appearance.interface_style, style, style.label());
+            }
+        });
+        if previous != self.config.appearance.interface_style {
+            let result = self.config.save(&self.root);
+            self.result(result, "");
+        }
+        ui.separator();
         if variant::LITE {
             self.lite_appearance(ui, ctx);
             return;
         }
-        ui.label("Стиль");
+        ui.label("Цветовая тема");
         ui.columns(4, |columns| {
             for (theme, column) in appearance::Theme::ALL.into_iter().zip(columns) {
                 if column
@@ -2939,7 +2951,7 @@ impl Launcher {
                                     ui.add(
                                         egui::Image::new(texture)
                                             .fit_to_exact_size(Vec2::splat(42.))
-                                            .corner_radius(4.),
+                                            .corner_radius(ui.visuals().widgets.inactive.corner_radius),
                                     );
                                 } else {
                                     let rect = ui
@@ -2965,8 +2977,8 @@ impl Launcher {
         ui.add_enabled_ui(!self.busy, |ui| {
             ui.horizontal(|ui| {
                 let old = self.source;
-                ui.selectable_value(&mut self.source, Source::Modrinth, "Modrinth");
-                ui.selectable_value(&mut self.source, Source::CurseForge, "CurseForge");
+                ui::tab_value(ui, &mut self.source, Source::Modrinth, "Modrinth");
+                ui::tab_value(ui, &mut self.source, Source::CurseForge, "CurseForge");
                 if old != self.source {
                     self.projects.clear();
                     self.searched = false;
@@ -3198,7 +3210,7 @@ impl Launcher {
                                     egui::Frame::new()
                                         .fill(ui.visuals().selection.bg_fill)
                                         .inner_margin(egui::Margin::symmetric(6, 2))
-                                        .corner_radius(4.)
+                                        .corner_radius(ui.visuals().widgets.inactive.corner_radius)
                                         .show(ui, |ui| {
                                             ui.label(RichText::new(category).size(10.));
                                         });

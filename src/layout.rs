@@ -268,13 +268,7 @@ pub fn panel_animated(
             ui.set_opacity(opacity);
             ui.set_min_size(rect.size());
             ui.set_max_size(rect.size());
-            ui.painter().rect(
-                rect,
-                ui.visuals().window_corner_radius,
-                ui.visuals().panel_fill,
-                ui.visuals().window_stroke,
-                egui::StrokeKind::Inside,
-            );
+            crate::ui::paint_panel(ui, rect);
             let inner = rect.shrink(PAD);
             let mut child = ui.new_child(
                 egui::UiBuilder::new()

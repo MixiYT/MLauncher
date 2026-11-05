@@ -54,6 +54,55 @@ impl crate::model::BuildIcon {
     }
 }
 
+pub fn paint_surface(
+    ui: &egui::Ui,
+    rect: Rect,
+    radius: egui::CornerRadius,
+    fill: Color32,
+    stroke: Stroke,
+) {
+    ui.painter()
+        .rect(rect, radius, fill, stroke, egui::StrokeKind::Inside);
+    if crate::appearance::InterfaceStyle::current(ui.ctx())
+        == crate::appearance::InterfaceStyle::LiquidGlass
+    {
+        ui.painter().rect_stroke(
+            rect.shrink(1.5),
+            radius,
+            Stroke::new(1_f32, Color32::from_white_alpha(12)),
+            egui::StrokeKind::Inside,
+        );
+        let inset = (radius.nw as f32).min(rect.width() * 0.25);
+        ui.painter().line_segment(
+            [
+                rect.left_top() + Vec2::new(inset, 1.),
+                rect.right_top() + Vec2::new(-inset, 1.),
+            ],
+            Stroke::new(1_f32, Color32::from_white_alpha(55)),
+        );
+    }
+}
+
+pub fn paint_panel(ui: &egui::Ui, rect: Rect) {
+    let visuals = ui.visuals();
+    if crate::appearance::InterfaceStyle::current(ui.ctx())
+        != crate::appearance::InterfaceStyle::Standard
+    {
+        ui.painter().add(
+            visuals
+                .window_shadow
+                .as_shape(rect, visuals.window_corner_radius),
+        );
+    }
+    paint_surface(
+        ui,
+        rect,
+        visuals.window_corner_radius,
+        visuals.panel_fill,
+        visuals.window_stroke,
+    );
+}
+
 pub fn icon_button(ui: &mut egui::Ui, icon: Icon, tooltip: &str) -> Response {
     icon_button_size(ui, icon, tooltip, Vec2::new(40., 32.))
 }
@@ -61,12 +110,12 @@ pub fn icon_button(ui: &mut egui::Ui, icon: Icon, tooltip: &str) -> Response {
 pub fn icon_button_size(ui: &mut egui::Ui, icon: Icon, tooltip: &str, size: Vec2) -> Response {
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let visuals = ui.style().interact(&response);
-    ui.painter().rect(
+    paint_surface(
+        ui,
         rect,
         visuals.corner_radius,
         visuals.bg_fill,
         visuals.bg_stroke,
-        egui::StrokeKind::Inside,
     );
     paint_icon(
         ui,
@@ -101,8 +150,11 @@ pub fn catalog_thumbnail(
     size: f32,
 ) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
-    ui.painter()
-        .rect_filled(rect, 5., ui.visuals().selection.bg_fill);
+    ui.painter().rect_filled(
+        rect,
+        ui.visuals().widgets.inactive.corner_radius,
+        ui.visuals().selection.bg_fill,
+    );
     if let Some(texture) = texture {
         let dimensions = texture.size_vec2();
         let image_rect = Rect::from_center_size(
@@ -124,13 +176,7 @@ pub fn provider_button(ui: &mut egui::Ui, icon: Icon, text: &str) -> Response {
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.), Sense::click());
     let v = ui.style().interact(&response);
-    ui.painter().rect(
-        rect,
-        v.corner_radius,
-        v.bg_fill,
-        v.bg_stroke,
-        egui::StrokeKind::Inside,
-    );
+    paint_surface(ui, rect, v.corner_radius, v.bg_fill, v.bg_stroke);
     paint_icon(
         ui,
         icon,
@@ -148,37 +194,96 @@ pub fn provider_button(ui: &mut egui::Ui, icon: Icon, text: &str) -> Response {
 }
 
 pub fn icon_tab(ui: &mut egui::Ui, icon: Icon, label: &str, selected: bool) -> Response {
+    tab_button(ui, Some(icon), label, selected)
+}
+
+pub fn tab_value<T: PartialEq>(
+    ui: &mut egui::Ui,
+    value: &mut T,
+    selected: T,
+    label: &str,
+) -> Response {
+    let mut response = tab_button(ui, None, label, *value == selected);
+    if response.clicked() && *value != selected {
+        *value = selected;
+        response.mark_changed();
+    }
+    response
+}
+
+fn tab_button(ui: &mut egui::Ui, icon: Option<Icon>, label: &str, selected: bool) -> Response {
+    use crate::appearance::InterfaceStyle;
     let galley = ui.painter().layout_no_wrap(
         label.to_owned(),
         egui::FontId::proportional(13.),
         ui.visuals().text_color(),
     );
+    let padding = if icon.is_some() { 42. } else { 24. };
     let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(galley.size().x + 42., 32.), Sense::click());
+        ui.allocate_exact_size(Vec2::new(galley.size().x + padding, 32.), Sense::click());
     let visuals = ui.style().interact(&response);
-    ui.painter().rect(
-        rect,
-        visuals.corner_radius,
-        if selected {
-            ui.visuals().selection.bg_fill
-        } else {
-            visuals.bg_fill
-        },
-        visuals.bg_stroke,
-        egui::StrokeKind::Inside,
-    );
-    paint_icon(
-        ui,
-        icon,
-        Rect::from_center_size(rect.left_center() + Vec2::new(16., 0.), Vec2::splat(18.)),
-        visuals.fg_stroke.color,
-    );
+    let style = InterfaceStyle::current(ui.ctx());
+    let fill = if selected {
+        ui.visuals().selection.bg_fill
+    } else {
+        visuals.bg_fill
+    };
+    match style {
+        InterfaceStyle::Material => {
+            if response.hovered() || selected {
+                paint_surface(
+                    ui,
+                    rect.shrink2(Vec2::new(0., 2.)),
+                    10.into(),
+                    fill,
+                    Stroke::NONE,
+                );
+            }
+            if selected {
+                ui.painter().rect_filled(
+                    Rect::from_min_max(
+                        rect.left_bottom() + Vec2::new(8., -3.),
+                        rect.right_bottom() - Vec2::new(8., 0.),
+                    ),
+                    2.,
+                    ui.visuals().hyperlink_color,
+                );
+            }
+        }
+        InterfaceStyle::Simple => {
+            let stroke = if selected {
+                Stroke::new(1_f32, ui.visuals().hyperlink_color)
+            } else {
+                visuals.bg_stroke
+            };
+            paint_surface(ui, rect, 2.into(), fill, stroke);
+        }
+        InterfaceStyle::Standard | InterfaceStyle::LiquidGlass => {
+            paint_surface(ui, rect, visuals.corner_radius, fill, visuals.bg_stroke);
+        }
+    }
+    let color = if selected && style != InterfaceStyle::Standard {
+        ui.visuals().selection.stroke.color
+    } else {
+        visuals.fg_stroke.color
+    };
+    let text_x = if let Some(icon) = icon {
+        paint_icon(
+            ui,
+            icon,
+            Rect::from_center_size(rect.left_center() + Vec2::new(16., 0.), Vec2::splat(18.)),
+            color,
+        );
+        30.
+    } else {
+        12.
+    };
     ui.painter().galley(
-        rect.left_center() + Vec2::new(30., -galley.size().y / 2.),
+        rect.left_center() + Vec2::new(text_x, -galley.size().y / 2.),
         galley,
-        visuals.fg_stroke.color,
+        color,
     );
-    response
+    response.on_hover_text(label)
 }
 
 pub fn paint_icon(ui: &egui::Ui, icon: Icon, rect: Rect, color: Color32) {
@@ -430,8 +535,13 @@ pub fn paint_icon(ui: &egui::Ui, icon: Icon, rect: Rect, color: Color32) {
         }
         Icon::Edit => {
             p.add(egui::Shape::closed_line(
-                vec![at(0.14, 0.86), at(0.23, 0.57), at(0.69, 0.11),
-                     at(0.89, 0.31), at(0.43, 0.77)],
+                vec![
+                    at(0.14, 0.86),
+                    at(0.23, 0.57),
+                    at(0.69, 0.11),
+                    at(0.89, 0.31),
+                    at(0.43, 0.77),
+                ],
                 s,
             ));
             line((0.57, 0.23), (0.77, 0.43));

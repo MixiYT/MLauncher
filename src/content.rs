@@ -304,8 +304,8 @@ impl Content {
         ui.add_enabled_ui(!self.busy,|ui|{
             ui.label(egui::RichText::new(&config.profiles[config.selected].name).strong()).on_hover_text(config.instance_dir(root).display().to_string());
             ui.horizontal_wrapped(|ui|{
-                ui.selectable_value(&mut self.indexed,false,"Полный ZIP").on_hover_text("Все моды внутри архива");
-                ui.selectable_value(&mut self.indexed,true,"Индекс").on_hover_text("Моды скачиваются на другом компьютере по точным версиям и хешам");
+                ui::tab_value(ui, &mut self.indexed, false, "Полный ZIP").on_hover_text("Все моды внутри архива");
+                ui::tab_value(ui, &mut self.indexed, true, "Индекс").on_hover_text("Моды скачиваются на другом компьютере по точным версиям и хешам");
                 ui::icon_button(ui,Icon::Info,"Миры, аккаунты, ключи и журналы не экспортируются. Проверьте конфигурации модов на личные данные. Распространяйте файлы только с разрешения авторов. Мод без известного источника требует полного ZIP.");
             });
             ui.horizontal(|ui|{
