@@ -50,6 +50,14 @@ enum Page {
     BuildEdit,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsTab {
+    Appearance,
+    Game,
+    Services,
+    Launcher,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum VersionTab {
     Catalog,
     Builds,
@@ -141,7 +149,7 @@ struct Launcher {
     thumbnails: media::Thumbnails,
     background: media::Background,
     applied_appearance: appearance::Appearance,
-    show_appearance: bool,
+    settings_tab: SettingsTab,
     background_path_input: String,
     installed_icons_requested: bool,
     layout_dirty_at: Option<f64>,
@@ -320,7 +328,7 @@ impl Launcher {
             thumbnails: Default::default(),
             background,
             applied_appearance,
-            show_appearance: true,
+            settings_tab: SettingsTab::Appearance,
             background_path_input,
             installed_icons_requested: false,
             layout_dirty_at: None,
@@ -1540,6 +1548,70 @@ impl Launcher {
     }
 
     fn settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal_wrapped(|ui| {
+            for (tab, label) in [
+                (SettingsTab::Appearance, "Оформление"),
+                (SettingsTab::Game, "Игра"),
+                (SettingsTab::Services, "Сервисы"),
+                (SettingsTab::Launcher, "Лаунчер"),
+            ] {
+                ui.selectable_value(&mut self.settings_tab, tab, label);
+            }
+        });
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .id_salt(("settings", self.settings_tab as u8))
+            .auto_shrink([false, false])
+            .max_height(ui.available_height())
+            .show(ui, |ui| match self.settings_tab {
+                SettingsTab::Appearance => {
+                    self.appearance_settings(ui, ctx);
+                    ui.separator();
+                    self.interface_settings(ui, ctx);
+                }
+                SettingsTab::Game => self.game_settings(ui, ctx),
+                SettingsTab::Services => self.service_settings(ui),
+                SettingsTab::Launcher => self.launcher_settings(ui, ctx),
+            });
+    }
+
+    fn launcher_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if cfg!(all(windows, target_arch = "x86_64")) {
+            ui.group(|ui| {
+                ui.strong("Обновления");
+                ui.label(format!("Установлена версия {}", env!("CARGO_PKG_VERSION")));
+                if self.checking_launcher_update {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Проверка GitHub и загрузка обновления…");
+                    });
+                    return;
+                }
+                match &self.launcher_update {
+                    Some(Ok(Some(update))) => {
+                        ui.label(format!("Версия {} скачана.", update.version));
+                        ui.label("Лаунчер установит обновление после завершения игры и загрузок.");
+                        if ui.button("Открыть папку с архивом").clicked() {
+                            let folder = update.archive.parent().unwrap_or(&self.root);
+                            self.result(open::that(folder).map_err(Into::into), "");
+                        }
+                    }
+                    Some(Ok(None)) => {
+                        ui.label("Установлена последняя доступная версия этой редакции.");
+                    }
+                    Some(Err(error)) => {
+                        ui.colored_label(
+                            ui.visuals().error_fg_color,
+                            format!("Не удалось проверить обновления: {error:#}"),
+                        );
+                    }
+                    None => {}
+                }
+                if ui.button("Проверить обновления").clicked() {
+                    self.check_launcher_update(ctx);
+                }
+            });
+        }
         ui.collapsing("Кеш лаунчера", |ui| {
             ui.label(self.cache_root.display().to_string());
             ui.horizontal_wrapped(|ui| {
@@ -1567,38 +1639,14 @@ impl Launcher {
                 }
             });
         });
-        if cfg!(all(windows, target_arch = "x86_64")) {
-            let ready = matches!(self.launcher_update, Some(Ok(Some(_))));
-            egui::CollapsingHeader::new("Обновления лаунчера")
-                .default_open(ready)
-                .show(ui, |ui| {
-                    if self.checking_launcher_update {
-                        ui.label("Проверка GitHub и загрузка обновления…");
-                        return;
-                    }
-                    match &self.launcher_update {
-                        Some(Ok(Some(update))) => {
-                            ui.label(format!("Версия {} скачана.", update.version));
-                            ui.label("Автоустановка ждёт завершения игры и загрузок. Архив также можно распаковать вручную.");
-                            if ui.button("Открыть папку с архивом").clicked() {
-                                let result = open::that(update.archive.parent().unwrap_or(&self.root)).map_err(Into::into);
-                                self.result(result, "");
-                            }
-                        }
-                        Some(Ok(None)) => { ui.label("Новых версий для этой редакции нет."); }
-                        Some(Err(error)) => { ui.label(format!("Не удалось получить обновление: {error:#}")); }
-                        None => {}
-                    }
-                    if ui.button("Проверить обновления").clicked() {
-                        self.check_launcher_update(ctx);
-                    }
-                });
-        }
         ui.horizontal_wrapped(|ui| {
             if ui::icon_tab(ui, Icon::Info, "О проекте", false).clicked() {
                 self.toggle_page(Page::About);
             }
         });
+    }
+
+    fn interface_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.collapsing("Расположение вкладок", |ui| {
             use model::LibraryGroup;
             let previous = self.config.library_tabs;
@@ -1622,55 +1670,19 @@ impl Launcher {
                 self.result(result, "");
             }
         });
-        if !variant::LITE {
-            let old = serde_json::to_string(&self.config.multi_session).unwrap_or_default();
-            let old_manual = self.config.curseforge_manual;
-            ui.collapsing("Мульти-Сессии",|ui|{
-            ui.checkbox(&mut self.config.multi_session.enabled,"Разрешить несколько Minecraft-сессий");
-            ui.add(egui::Slider::new(&mut self.config.multi_session.limit,1..=8).text("Лимит сессий"));
-            ui.add(egui::Slider::new(&mut self.config.multi_session.memory_mb,1024..=16384).text("МиБ на сессию"));
-            ui.label("Профиль экономии: минимум 256 МиБ, окно 854×480, без полноэкранного режима. Для тяжёлых сборок увеличьте память. Каждая сессия требует отдельную сборку; миры и настройки не разделяются.");
-            ui.label(format!("Лимит Java heap: {} МиБ суммарно (+ память JVM и системы).",self.config.multi_session.memory_mb as usize*self.config.multi_session.limit));
-            for session in &self.sessions {
-                ui.horizontal(|ui|{ui.label(format!("#{} · {} · {}",session.id,session.name,if session.running{"Работает"}else{"Подготовка"}));
-                    if ui.button("Остановить").clicked(){session.cancel.store(true,std::sync::atomic::Ordering::Relaxed);}
-                });
+        if ui.button("Сбросить размеры панелей").clicked() {
+            for id in layout::PanelId::ALL {
+                self.config.panels.set(id, id.default_size());
             }
-        });
-            ui.checkbox(&mut self.config.multi_session.native_overlay,"Внутриигровой оверлей · Shift+Tab (экспериментально)").on_hover_text("Для следующих запусков: внедрение DLL в запускаемую Java, без Minecraft-мода. Только Windows x64 / OpenGL. Vulkan не поддерживается. Возможны конфликты с античитами и другими оверлеями. При сбое отключите настройку и перезапустите игру.");
-            let dll = std::env::current_exe()
-                .unwrap_or_default()
-                .with_file_name("mlauncher-overlay.dll");
-            ui.label(
-                RichText::new(if dll.is_file() {
-                    "DLL оверлея найдена рядом с EXE; хеш проверяется при запуске."
-                } else {
-                    "DLL оверлея не найдена рядом с EXE — запуск игры пройдёт без оверлея."
-                })
-                .small(),
-            );
-            ui.checkbox(&mut self.config.curseforge_manual,"CurseForge: ручная загрузка (экспериментально)").on_hover_text("Официальный сайт в вашем браузере; затем выберите скачанный JAR. Не обходит запреты скачивания и не использует чужие API-ключи.");
-            if old != serde_json::to_string(&self.config.multi_session).unwrap_or_default()
-                || old_manual != self.config.curseforge_manual
-            {
-                let result = self.config.save(&self.root);
-                self.result(result, "");
-            }
+            self.layout_dirty_at = Some(ctx.input(|i| i.time));
+            self.persist_layout();
+            ctx.request_repaint();
         }
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.show_appearance, true, "Оформление");
-            ui.selectable_value(&mut self.show_appearance, false, "Аккаунты и сборка");
-        });
-        ui.separator();
-        if self.show_appearance {
-            self.appearance_settings(ui, ctx);
-            return;
-        }
+    }
+
+    fn game_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.java_settings(ui, ctx);
-        ui.separator();
-        if !variant::LITE {
-            self.ai_settings(ui);
-        }
+        self.multiplayer_settings(ui);
         ui.separator();
         let field_width = (ui.available_width() - 144.).max(120.);
         egui::Grid::new("settings_grid")
@@ -1701,6 +1713,63 @@ impl Launcher {
                 )
                 .on_hover_text(self.config.instance_dir(&self.root).display().to_string());
                 ui.end_row();
+            });
+        ui.horizontal(|ui| {
+            if ui.button("Сохранить").clicked() {
+                if self.game_cancel.is_none()
+                    && self.config.sync_directory(self.config.selected, &self.root)
+                {
+                    self.refresh_installed();
+                }
+                self.save();
+            }
+            if icon_button(ui, Icon::Folder, "Папка сборки").clicked() {
+                self.open_folder();
+            }
+        });
+    }
+
+    fn multiplayer_settings(&mut self, ui: &mut egui::Ui) {
+        if variant::LITE {
+            return;
+        }
+        ui.collapsing("Мультисессии и оверлей", |ui| {
+            let old = serde_json::to_string(&self.config.multi_session).unwrap_or_default();
+            ui.checkbox(&mut self.config.multi_session.enabled,"Разрешить несколько Minecraft-сессий");
+            ui.add(egui::Slider::new(&mut self.config.multi_session.limit,1..=8).text("Лимит сессий"));
+            ui.add(egui::Slider::new(&mut self.config.multi_session.memory_mb,1024..=16384).text("МиБ на сессию"));
+            ui.label("Профиль экономии: минимум 256 МиБ, окно 854×480, без полноэкранного режима. Для тяжёлых сборок увеличьте память. Каждая сессия требует отдельную сборку; миры и настройки не разделяются.");
+            ui.label(format!("Лимит Java heap: {} МиБ суммарно (+ память JVM и системы).",self.config.multi_session.memory_mb as usize*self.config.multi_session.limit));
+            for session in &self.sessions {
+                ui.horizontal(|ui|{ui.label(format!("#{} · {} · {}",session.id,session.name,if session.running{"Работает"}else{"Подготовка"}));
+                    if ui.button("Остановить").clicked(){session.cancel.store(true,std::sync::atomic::Ordering::Relaxed);}
+                });
+            }
+            ui.checkbox(&mut self.config.multi_session.native_overlay,"Внутриигровой оверлей · Shift+Tab (экспериментально)").on_hover_text("Для следующих запусков: внедрение DLL в запускаемую Java, без Minecraft-мода. Только Windows x64 / OpenGL. Vulkan не поддерживается. Возможны конфликты с античитами и другими оверлеями. При сбое отключите настройку и перезапустите игру.");
+            let dll = std::env::current_exe()
+                .unwrap_or_default()
+                .with_file_name("mlauncher-overlay.dll");
+            ui.label(
+                RichText::new(if dll.is_file() {
+                    "DLL оверлея найдена рядом с EXE; хеш проверяется при запуске."
+                } else {
+                    "DLL оверлея не найдена рядом с EXE — запуск игры пройдёт без оверлея."
+                })
+                .small(),
+            );
+            if old != serde_json::to_string(&self.config.multi_session).unwrap_or_default() {
+                let result = self.config.save(&self.root);
+                self.result(result, "");
+            }
+        });
+    }
+
+    fn service_settings(&mut self, ui: &mut egui::Ui) {
+        let field_width = (ui.available_width() - 144.).max(120.);
+        egui::Grid::new("service_credentials")
+            .num_columns(2)
+            .spacing(Vec2::new(16., 8.))
+            .show(ui, |ui| {
                 ui.add_sized(
                     [128., layout::ROW],
                     egui::Label::new("Microsoft Client ID").wrap(),
@@ -1728,29 +1797,16 @@ impl Launcher {
         .on_hover_text(
             "Personal Microsoft accounts, public client/device flow; нужен доступ к Minecraft API",
         );
-        ui.horizontal(|ui| {
-            if ui.button("Сохранить").clicked() {
-                if self.game_cancel.is_none()
-                    && self.config.sync_directory(self.config.selected, &self.root)
-                {
-                    self.refresh_installed();
-                }
-                self.save();
-                self.navigate(Page::Home);
-            }
-            if icon_button(ui, Icon::Folder, "Папка сборки").clicked() {
-                self.open_folder();
-            }
-        });
-        if ui.button("Сбросить размеры панелей").clicked() {
-            for id in layout::PanelId::ALL {
-                self.config.panels.set(id, id.default_size());
-            }
-            self.layout_dirty_at = Some(ctx.input(|i| i.time));
-            self.persist_layout();
-            ctx.request_repaint();
+        if !variant::LITE {
+            ui.checkbox(&mut self.config.curseforge_manual,"CurseForge: ручная загрузка (экспериментально)").on_hover_text("Официальный сайт в вашем браузере; затем выберите скачанный JAR. Не обходит запреты скачивания и не использует чужие API-ключи.");
+            ui.separator();
+            self.ai_settings(ui);
+        }
+        if ui.button("Сохранить").clicked() {
+            self.save();
         }
     }
+
     fn java_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         use model::OnGameStart;
         let modes = [
@@ -3129,13 +3185,15 @@ impl Launcher {
             self.ai_ui(ui, ctx);
         } else if self.page == Page::BuildEdit {
             self.edit_instance(ui, ctx);
+        } else if self.page == Page::Settings {
+            self.settings(ui, ctx);
         } else if self.page == Page::Mods {
             self.mods(ui, ctx);
         } else if self.page == Page::Versions && self.instance_version.is_none() {
             self.version_picker(ui, ctx);
         } else {
             egui::ScrollArea::vertical().id_salt(("detail",self.panel_id())).auto_shrink([false,false]).max_height(ui.available_height()).show(ui,|ui|{match self.page{
-            Page::Accounts=>self.accounts(ui,ctx),Page::Settings=>self.settings(ui,ctx),Page::Versions=>self.version_picker(ui,ctx),
+            Page::Accounts=>self.accounts(ui,ctx),Page::Versions=>self.version_picker(ui,ctx),
             Page::About=>{
                 ui.label(format!("{} {} · игровая бета",variant::NAME,env!("CARGO_PKG_VERSION")));
                 ui.label("Vanilla, Fabric, Quilt, Forge и NeoForge. Аккаунты Ely.by, Microsoft и без пароля. Сессии хранятся зашифрованными через Windows DPAPI.");
@@ -3233,7 +3291,7 @@ impl Launcher {
                         self.prepare_ai_report();
                     }
                     if ui.button("Настройка API").clicked() {
-                        self.show_appearance = false;
+                        self.settings_tab = SettingsTab::Services;
                         self.navigate(Page::Settings);
                     }
                 });
