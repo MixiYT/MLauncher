@@ -6,13 +6,17 @@
 
 ## Скриншоты
 
-Интерфейс MLauncher 0.3.10 для Windows. Тема AMOLED и встроенный фон «Пейзаж».
+Интерфейс MLauncher для Windows. Тема AMOLED и встроенный фон «Пейзаж».
 
 ### Стили интерфейса
 
 В «Настройки → Оформление» можно выбрать Material, Liquid Glass или Simple.
 Стиль применяется к панелям, вкладкам, кнопкам, редактору сборки и выпадающим меню
 и сохраняется отдельно от цветовой темы. Все три стиля доступны и в Lite.
+
+| Material | Liquid Glass | Simple |
+| --- | --- | --- |
+| ![Material](docs/screenshots/material.png) | ![Liquid Glass](docs/screenshots/liquid-glass.png) | ![Simple](docs/screenshots/simple.png) |
 
 ### Главный экран
 
