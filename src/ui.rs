@@ -228,14 +228,23 @@ fn tab_button(ui: &mut egui::Ui, icon: Option<Icon>, label: &str, selected: bool
         ui.allocate_exact_size(Vec2::new(galley.size().x + padding, 32.), Sense::click());
     let visuals = ui.style().interact(&response);
     let style = InterfaceStyle::current(ui.ctx());
-    let fill = if selected {
-        ui.visuals().selection.bg_fill
-    } else {
-        visuals.bg_fill
-    };
+    let enabled = ui.ctx().data(|d| {
+        d.get_temp::<bool>(egui::Id::new("category_transitions"))
+            .unwrap_or(true)
+    });
+    let phase = ui.ctx().animate_bool_with_time(
+        response.id.with("selection"),
+        selected,
+        if enabled { 0.16 } else { 0. },
+    );
+    let fill = egui::lerp(
+        egui::Rgba::from(visuals.bg_fill)..=egui::Rgba::from(ui.visuals().selection.bg_fill),
+        phase,
+    )
+    .into();
     match style {
         InterfaceStyle::Material => {
-            if response.hovered() || selected {
+            if response.hovered() || phase > 0.001 {
                 paint_surface(
                     ui,
                     rect.shrink2(Vec2::new(0., 2.)),
@@ -244,23 +253,25 @@ fn tab_button(ui: &mut egui::Ui, icon: Option<Icon>, label: &str, selected: bool
                     Stroke::NONE,
                 );
             }
-            if selected {
+            if phase > 0.001 {
                 ui.painter().rect_filled(
                     Rect::from_min_max(
                         rect.left_bottom() + Vec2::new(8., -3.),
                         rect.right_bottom() - Vec2::new(8., 0.),
                     ),
                     2.,
-                    ui.visuals().hyperlink_color,
+                    ui.visuals().hyperlink_color.gamma_multiply(phase),
                 );
             }
         }
         InterfaceStyle::Simple => {
-            let stroke = if selected {
-                Stroke::new(1_f32, ui.visuals().hyperlink_color)
-            } else {
-                visuals.bg_stroke
-            };
+            let color: Color32 = egui::lerp(
+                egui::Rgba::from(visuals.bg_stroke.color)
+                    ..=egui::Rgba::from(ui.visuals().hyperlink_color),
+                phase,
+            )
+            .into();
+            let stroke = Stroke::new(egui::lerp(visuals.bg_stroke.width..=1., phase), color);
             paint_surface(ui, rect, 2.into(), fill, stroke);
         }
         InterfaceStyle::Standard | InterfaceStyle::LiquidGlass => {
@@ -552,5 +563,59 @@ pub fn paint_icon(ui: &egui::Ui, icon: Icon, rect: Rect, color: Color32) {
             line((0.57, 0.23), (0.77, 0.43));
             line((0.23, 0.57), (0.43, 0.77));
         }
+    }
+}
+
+/// Category content fades in on selection changes; independent from panel motion and layout.
+pub fn category_fade(ui: &mut egui::Ui, key: impl std::hash::Hash, enabled: bool) {
+    let id = ui.id().with("category_transition");
+    let key = egui::Id::new(key);
+    let now = ui.input(|i| i.time);
+    let (previous, started) = ui.ctx().data_mut(|d| {
+        let old = d.get_temp::<(egui::Id, f64)>(id).unwrap_or((key, now - 1.));
+        let state = if old.0 != key { (key, now) } else { old };
+        d.insert_temp(id, state);
+        state
+    });
+    let _ = previous;
+    if enabled {
+        let t = ((now - started) / 0.18).clamp(0., 1.) as f32;
+        let alpha = t * t * (3. - 2. * t);
+        ui.multiply_opacity(alpha);
+        if t < 1. {
+            ui.ctx().request_repaint();
+        }
+    }
+}
+
+#[cfg(test)]
+mod category_tests {
+    use super::*;
+    #[test]
+    fn category_fades_by_time_without_changing_layout_and_can_be_disabled() {
+        let ctx = egui::Context::default();
+        let mut opacity = 0.;
+        let mut sample = |time, key, enabled| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        category_fade(ui, key, enabled);
+                        opacity = ui.opacity();
+                        ui.label("Category content");
+                    });
+                },
+            );
+            opacity
+        };
+        assert_eq!(sample(0., 1, true), 1.);
+        assert_eq!(sample(1., 2, true), 0.);
+        let middle = sample(1.09, 2, true);
+        assert!(middle > 0.4 && middle < 0.6);
+        assert_eq!(sample(1.3, 2, true), 1.);
+        assert_eq!(sample(1.4, 3, false), 1.);
     }
 }

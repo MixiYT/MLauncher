@@ -226,7 +226,10 @@ impl Default for Config {
             game_directory: String::new(),
             java: Default::default(),
             version_filters: default_version_filters(),
-            assistant: Default::default(),
+            assistant: crate::assistant::Settings {
+                use_shared: true,
+                ..Default::default()
+            },
             multi_session: Default::default(),
             curseforge_manual: false,
             on_game_start: OnGameStart::default(),

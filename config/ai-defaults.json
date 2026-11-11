@@ -1,0 +1,6 @@
+{
+  "revision": 1,
+  "enabled": false,
+  "endpoint": "https://mlauncher-ai.mlauncher-ai-gateway.workers.dev/v1/chat/completions",
+  "model": "openrouter/free"
+}

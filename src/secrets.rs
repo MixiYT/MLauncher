@@ -249,3 +249,14 @@ mod tests {
         assert!(load(root.path()).is_empty());
     }
 }
+
+/// Local developer credentials are never part of launcher config or exports.
+pub fn save_developer(root: &Path, data: &[u8]) -> Result<()> {
+    crate::downloads::atomic_write(&root.join("developer-keys.dat"), &protect(data)?)
+}
+pub fn load_developer(root: &Path) -> Option<Zeroizing<Vec<u8>>> {
+    std::fs::read(root.join("developer-keys.dat"))
+        .ok()
+        .and_then(|bytes| unprotect(&bytes).ok())
+        .map(Zeroizing::new)
+}

@@ -7,6 +7,8 @@ use std::{io::Read, time::Duration};
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub use_shared: bool,
+    pub developer_mode: bool,
     pub endpoint: String,
     pub model: String,
     pub auto_repair: bool,
@@ -15,6 +17,8 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            use_shared: false,
+            developer_mode: false,
             endpoint: "https://api.openai.com/v1/chat/completions".into(),
             model: "gpt-4.1-mini".into(),
             auto_repair: true,
@@ -53,6 +57,10 @@ fn request(
     anyhow::ensure!(
         report.len() <= 256 * 1024,
         "Отчёт слишком большой: оставьте до 256 КиБ"
+    );
+    anyhow::ensure!(
+        !settings.endpoint.trim().is_empty(),
+        "Общий ИИ пока не настроен. Укажите шлюз в режиме разработчика или выберите личный API."
     );
     let url = reqwest::Url::parse(settings.endpoint.trim())?;
     let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
@@ -167,6 +175,14 @@ repair исправляет только текущую сборку. update/dis
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_personal_provider_is_not_changed_to_shared() {
+        let settings: super::Settings =
+            serde_json::from_str(r#"{"endpoint":"https://personal.example/api","model":"custom"}"#)
+                .unwrap();
+        assert!(!settings.use_shared);
+        assert_eq!(settings.endpoint, "https://personal.example/api");
+    }
     #[test]
     fn compatible_api_request_and_structured_plan() {
         use std::io::{Read, Write};

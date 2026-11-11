@@ -161,6 +161,14 @@ impl Editor {
             }
         });
         ui.separator();
+        ui::category_fade(
+            ui,
+            ("editor", self.tab.folder()),
+            ui.ctx().data(|d| {
+                d.get_temp::<bool>(egui::Id::new("category_transitions"))
+                    .unwrap_or(true)
+            }),
+        );
         if blocked {
             ui.label("Изменения доступны после остановки игры и завершения установки.");
         }

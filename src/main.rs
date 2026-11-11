@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod agent;
+mod ai_gateway;
 mod api;
 mod appearance;
 mod assistant;
@@ -99,6 +100,8 @@ enum Event {
     JavaFound(Vec<java::Installation>),
     Game(u64, game::Event),
     Analysis(anyhow::Result<String>),
+    AiDefaults(anyhow::Result<ai_gateway::Defaults>),
+    AiKeysUploaded(anyhow::Result<()>),
     AiPlan(anyhow::Result<assistant::Plan>),
     AiApplied(anyhow::Result<agent::Outcome>),
     AiUndone(anyhow::Result<agent::Outcome>),
@@ -183,6 +186,11 @@ struct Launcher {
     delete_build_folder: bool,
     avatars: avatars::Avatars,
     build_editor: Option<instance::Editor>,
+    ai_defaults: ai_gateway::Defaults,
+    pending_ai_defaults: Option<ai_gateway::Defaults>,
+    developer: ai_gateway::Developer,
+    ai_defaults_checked: Option<std::time::Instant>,
+    ai_defaults_busy: bool,
     ai_key: zeroize::Zeroizing<String>,
     ai_question: String,
     ai_report: String,
@@ -305,6 +313,12 @@ impl Launcher {
         let applied_appearance = config.appearance.clone();
         let background_path_input = config.appearance.background.clone();
         let (ai_key, cf_key) = secrets::load_api_keys(&root);
+        let developer = ai_gateway::Developer::load(&root);
+        let ai_defaults = std::fs::read(root.join("ai-defaults.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ai_gateway::Defaults>(&bytes).ok())
+            .filter(|d| d.validate().is_ok())
+            .unwrap_or_default();
         let cache_root = if start_workers {
             std::env::current_exe()
                 .ok()
@@ -406,6 +420,11 @@ impl Launcher {
             avatars: Default::default(),
             build_editor: None,
             panel_motion: Default::default(),
+            ai_defaults,
+            pending_ai_defaults: None,
+            developer,
+            ai_defaults_checked: None,
+            ai_defaults_busy: false,
             ai_key: zeroize::Zeroizing::new(ai_key),
             ai_question: String::new(),
             ai_report: String::new(),
@@ -427,6 +446,7 @@ impl Launcher {
         }
         app.refresh_installed();
         if start_workers {
+            app.check_ai_defaults(ctx);
             app.scan_builds(ctx, None);
             if cfg!(all(windows, target_arch = "x86_64")) {
                 app.check_launcher_update(ctx);
@@ -1084,6 +1104,41 @@ impl Launcher {
                     }
                     self.launcher_update = Some(result);
                 }
+                Event::AiDefaults(result) => {
+                    self.ai_defaults_busy = false;
+                    match result {
+                        Ok(defaults) if defaults.revision >= self.ai_defaults.revision => {
+                            if let Ok(bytes) = serde_json::to_vec(&defaults) {
+                                let _ = downloads::atomic_write(
+                                    &self.root.join("ai-defaults.json"),
+                                    &bytes,
+                                );
+                            }
+                            if self.ai_task.is_some() || self.ai_busy {
+                                self.pending_ai_defaults = Some(defaults);
+                            } else {
+                                self.ai_defaults = defaults;
+                            }
+                            self.developer.status = format!(
+                                "Публичный конфиг обновлён: ревизия {}",
+                                self.ai_defaults.revision
+                            );
+                        }
+                        Ok(_) => {
+                            self.developer.status =
+                                "Получена устаревшая ревизия, сохранены текущие настройки".into()
+                        }
+                        Err(_) => {
+                            self.developer.status =
+                                "Не удалось обновить общий ИИ. Сохранён последний рабочий конфиг."
+                                    .into()
+                        }
+                    }
+                }
+                Event::AiKeysUploaded(result) => {
+                    self.developer.busy = false;
+                    self.developer.status = match result { Ok(()) => "Пул обновлён в Cloudflare Secrets. Клиентам обновление ключей не требуется.".into(), Err(e) => format!("{e:#}") };
+                }
                 Event::AiPlan(result) => self.apply_ai_plan(result, ctx),
                 Event::AiApplied(result) => self.finish_ai_action(result, ctx),
                 Event::AiUndone(result) => {
@@ -1657,6 +1712,11 @@ impl Launcher {
             }
         });
         ui.separator();
+        ui::category_fade(
+            ui,
+            ("settings", self.settings_tab as u8),
+            self.config.appearance.transitions,
+        );
         egui::ScrollArea::vertical()
             .id_salt(("settings", self.settings_tab as u8))
             .auto_shrink([false, false])
@@ -2656,6 +2716,11 @@ impl Launcher {
             self.instance_version = None;
         }
         ui.separator();
+        ui::category_fade(
+            ui,
+            ("versions", self.version_tab as u8),
+            self.config.appearance.transitions,
+        );
         let section = match self.version_tab {
             VersionTab::Packs => Some(content::Section::Packs),
             VersionTab::Exchange => Some(content::Section::Exchange),
@@ -2888,6 +2953,11 @@ impl Launcher {
                 self.maps_tab = true;
             }
         });
+        ui::category_fade(
+            ui,
+            ("mods", self.resource_tab, self.installed_tab, self.maps_tab),
+            self.config.appearance.transitions,
+        );
         if self.resource_tab {
             self.resource_catalog.set_section(if self.maps_tab {
                 content::Section::Maps
@@ -3447,17 +3517,83 @@ impl Launcher {
             ctx.request_repaint();
         });
     }
+    fn effective_ai(&self) -> (assistant::Settings, zeroize::Zeroizing<String>) {
+        let mut settings = self.config.assistant.clone();
+        if settings.use_shared {
+            settings.endpoint = if self.ai_defaults.enabled {
+                self.ai_defaults.endpoint.clone()
+            } else {
+                String::new()
+            };
+            settings.model = self.ai_defaults.model.clone();
+            (settings, zeroize::Zeroizing::new(String::new()))
+        } else {
+            (settings, zeroize::Zeroizing::new(self.ai_key.to_string()))
+        }
+    }
+    fn check_ai_defaults(&mut self, ctx: &egui::Context) {
+        if self.ai_defaults_busy || self.ai_task.is_some() || self.ai_busy {
+            return;
+        }
+        self.ai_defaults_busy = true;
+        self.ai_defaults_checked = Some(std::time::Instant::now());
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(Event::AiDefaults(ai_gateway::fetch()));
+            ctx.request_repaint();
+        });
+    }
     fn ai_settings(&mut self, ui: &mut egui::Ui) {
-        ui.strong("ИИ-помощник · OpenAI-совместимый API");
-        ui.label("URL запроса (полный, с /chat/completions)");
-        ui.text_edit_singleline(&mut self.config.assistant.endpoint);
-        ui.label("Модель");
-        ui.text_edit_singleline(&mut self.config.assistant.model);
-        ui.label("API-ключ (шифруется DPAPI)");
-        ui.add(egui::TextEdit::singleline(&mut *self.ai_key).password(true));
-        ui.small("Журналы не отправляются автоматически. Перед отправкой можно проверить и отредактировать отчёт. Автоматические действия запускаются отдельной кнопкой в помощнике.");
+        ui.strong("ИИ-помощник");
+        ui.checkbox(
+            &mut self.config.assistant.use_shared,
+            "Общий ИИ лаунчера (без личного ключа)",
+        );
+        if self.config.assistant.use_shared {
+            ui.label(if self.ai_defaults.enabled {
+                format!(
+                    "{} · {} · ревизия {}",
+                    self.ai_defaults.endpoint, self.ai_defaults.model, self.ai_defaults.revision
+                )
+            } else {
+                "Общий ИИ ещё не настроен владельцем".into()
+            });
+            if ui
+                .add_enabled(
+                    !self.ai_defaults_busy,
+                    egui::Button::new("Обновить настройки общего ИИ"),
+                )
+                .clicked()
+            {
+                self.check_ai_defaults(ui.ctx());
+            }
+        } else {
+            ui.label("URL запроса (полный, с /chat/completions)");
+            ui.text_edit_singleline(&mut self.config.assistant.endpoint);
+            ui.label("Модель");
+            ui.text_edit_singleline(&mut self.config.assistant.model);
+            ui.label("Личный API-ключ (DPAPI)");
+            ui.add(egui::TextEdit::singleline(&mut *self.ai_key).password(true));
+        }
+        ui.small("Запросы и журналы отправляются только после действия в помощнике. Получатель показан перед отправкой.");
         if ui.button("Открыть помощника").clicked() {
             self.navigate(Page::Help);
+        }
+        ui.checkbox(
+            &mut self.config.assistant.developer_mode,
+            "Режим разработчика",
+        );
+        if !self.config.assistant.developer_mode {
+            self.developer.lock();
+        }
+        if self.config.assistant.developer_mode && self.developer.ui(ui, &self.root) {
+            let developer = self.developer.clone();
+            let (tx, ctx) = (self.tx.clone(), ui.ctx().clone());
+            self.developer.busy = true;
+            std::thread::spawn(move || {
+                let _ = tx.send(Event::AiKeysUploaded(developer.upload()));
+                ctx.request_repaint();
+            });
         }
     }
     fn prepare_ai_report(&mut self) {
@@ -3475,7 +3611,12 @@ impl Launcher {
         self.ai_report = self.sanitize_ai_report(&report);
     }
     fn sanitize_ai_report(&self, report: &str) -> String {
-        let mut secrets = vec![self.ai_key.as_str(), self.key.as_str()];
+        let mut secrets = vec![
+            self.ai_key.as_str(),
+            self.key.as_str(),
+            self.developer.token.as_str(),
+        ];
+        secrets.extend(self.developer.keys.iter().map(String::as_str));
         for a in &self.config.accounts {
             if let Some(s) = &a.session {
                 secrets.push(&s.access_token);
@@ -3557,8 +3698,7 @@ impl Launcher {
         })
         .to_string();
         let report = self.sanitize_ai_report(&report);
-        let settings = self.config.assistant.clone();
-        let key = zeroize::Zeroizing::new(self.ai_key.to_string());
+        let (settings, key) = self.effective_ai();
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         self.ai_busy = true;
         self.navigate(Page::Help);
@@ -3744,7 +3884,7 @@ impl Launcher {
                         .desired_rows(2)
                         .desired_width(f32::INFINITY),
                 );
-                ui.small(format!("Запрос, параметры сборки и журналы будут переданы в {}. При включённом автоисправлении после сбоя они отправляются повторно.", self.config.assistant.endpoint));
+                ui.small(format!("Запрос, параметры сборки и журналы будут переданы в {}. При включённом автоисправлении после сбоя они отправляются повторно.", self.effective_ai().0.endpoint));
                 let old_settings = serde_json::to_string(&self.config.assistant).unwrap_or_default();
                 ui.checkbox(&mut self.config.assistant.auto_repair, "Автоматически исправлять сбои ИИ-запуска");
                 ui.add(egui::Slider::new(&mut self.config.assistant.max_repairs, 1..=3).text("Попыток исправления"));
@@ -3832,7 +3972,7 @@ impl Launcher {
                             .desired_rows(8)
                             .desired_width(f32::INFINITY),
                     );
-                    ui.label(format!("Получатель: {}", self.config.assistant.endpoint));
+                    ui.label(format!("Получатель: {}", self.effective_ai().0.endpoint));
                     if ui
                         .add_enabled(
                             !self.ai_busy && self.ai_task.is_none(),
@@ -3840,8 +3980,7 @@ impl Launcher {
                         )
                         .clicked()
                     {
-                        let settings = self.config.assistant.clone();
-                        let key = zeroize::Zeroizing::new(self.ai_key.to_string());
+                        let (settings, key) = self.effective_ai();
                         let report = self.sanitize_ai_report(&self.ai_report);
                         let (tx, ctx) = (self.tx.clone(), ctx.clone());
                         self.ai_busy = true;
@@ -4228,6 +4367,24 @@ impl eframe::App for Launcher {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         #[cfg(windows)]
         self.tray.bind(_frame);
+        ctx.data_mut(|d| {
+            d.insert_temp(
+                egui::Id::new("category_transitions"),
+                self.config.appearance.transitions,
+            )
+        });
+        if self
+            .ai_defaults_checked
+            .is_some_and(|t| t.elapsed() >= std::time::Duration::from_secs(3600))
+        {
+            self.check_ai_defaults(ctx);
+        }
+        ctx.request_repaint_after(std::time::Duration::from_secs(3600));
+        if self.ai_task.is_none() && !self.ai_busy {
+            if let Some(defaults) = self.pending_ai_defaults.take() {
+                self.ai_defaults = defaults;
+            }
+        }
         self.pacing.begin(_frame, self.background.throttle_signal());
         self.render(ctx);
         #[cfg(windows)]
@@ -4528,6 +4685,34 @@ mod ui_tests {
             assert!(used.right() <= inner.right() + 1.);
             assert!(used.bottom() <= inner.bottom() + 1.);
         }
+    }
+    #[test]
+    fn shared_gateway_never_receives_personal_or_developer_keys() {
+        let ctx = egui::Context::default();
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.assistant.endpoint = "https://personal.example/chat".into();
+        let mut app = Launcher::new(&ctx, root.path().into(), config, false, String::new());
+        app.ai_key = zeroize::Zeroizing::new("PERSONAL-SECRET".into());
+        app.developer.token = "CLOUDFLARE-SECRET".into();
+        app.developer.keys = vec!["POOL-SECRET".into()];
+        app.ai_defaults = ai_gateway::Defaults {
+            revision: 2,
+            enabled: true,
+            endpoint: "https://shared.example/v1/chat/completions".into(),
+            model: "openrouter/free".into(),
+        };
+        let (shared, key) = app.effective_ai();
+        assert!(key.is_empty());
+        assert_eq!(shared.endpoint, app.ai_defaults.endpoint);
+        app.config.assistant.use_shared = false;
+        let (personal, key) = app.effective_ai();
+        assert_eq!(key.as_str(), "PERSONAL-SECRET");
+        assert_eq!(personal.endpoint, "https://personal.example/chat");
+        let report = app.sanitize_ai_report("PERSONAL-SECRET CLOUDFLARE-SECRET POOL-SECRET");
+        assert!(!report.contains("SECRET"));
+        let config = serde_json::to_string(&app.config).unwrap();
+        assert!(!config.contains("SECRET"));
     }
     #[test]
     fn animation_retarget_keeps_velocity_and_is_independent_of_refresh_rate() {
