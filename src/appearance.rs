@@ -65,6 +65,13 @@ pub struct Appearance {
     pub effect: crate::effects::Effect,
     pub light_background: bool,
     pub transitions: bool,
+    pub show_build_icons: bool,
+    pub show_account_icons: bool,
+    pub animate_icons: bool,
+    pub animate_menus: bool,
+    pub classic_title_bar: bool,
+    pub split_version_creation: bool,
+    pub colored_loader_icons: bool,
 }
 impl Default for Appearance {
     fn default() -> Self {
@@ -79,6 +86,13 @@ impl Default for Appearance {
             effect: Default::default(),
             light_background: false,
             transitions: true,
+            show_build_icons: true,
+            show_account_icons: true,
+            animate_icons: true,
+            animate_menus: true,
+            classic_title_bar: false,
+            split_version_creation: false,
+            colored_loader_icons: false,
         }
     }
 }
@@ -87,6 +101,10 @@ impl Appearance {
         Color32::from_rgb(self.accent[0], self.accent[1], self.accent[2])
     }
     pub fn apply(&self, ctx: &egui::Context) {
+        ctx.data_mut(|data| {
+            data.insert_temp(egui::Id::new("animate_icons"), self.animate_icons);
+            data.insert_temp(egui::Id::new("animate_menus"), self.animate_menus);
+        });
         let mut style = (*ctx.style()).clone();
         let light = self.theme == Theme::Light;
         style.visuals = if light {
@@ -178,14 +196,15 @@ impl Appearance {
                 style.spacing.button_padding = Vec2::new(12., 6.);
             }
             InterfaceStyle::LiquidGlass => {
-                let alpha = self.panel_opacity.clamp(170, 225);
-                let glass = if light { [230, 240, 250] } else { [25, 40, 58] };
+                let alpha = self.panel_opacity.clamp(140, 155);
+                let glass = if light { [234, 242, 250] } else { [11, 17, 24] };
                 style.visuals.panel_fill =
                     Color32::from_rgba_unmultiplied(glass[0], glass[1], glass[2], alpha);
-                style.visuals.window_fill = style.visuals.panel_fill;
+                style.visuals.window_fill =
+                    Color32::from_rgba_unmultiplied(glass[0], glass[1], glass[2], 228);
                 style.visuals.window_stroke = Stroke::new(
                     1_f32,
-                    Color32::from_white_alpha(if light { 150 } else { 48 }),
+                    Color32::from_white_alpha(if light { 142 } else { 43 }),
                 );
                 style.visuals.window_corner_radius = 20.into();
                 style.visuals.window_shadow = egui::epaint::Shadow {
@@ -194,7 +213,11 @@ impl Appearance {
                     spread: 1,
                     color: Color32::from_black_alpha(70),
                 };
-                let surface = Color32::from_rgba_unmultiplied(glass[0], glass[1], glass[2], 210);
+                let surface = if light {
+                    Color32::from_white_alpha(122)
+                } else {
+                    Color32::from_white_alpha(20)
+                };
                 for widget in [
                     &mut style.visuals.widgets.inactive,
                     &mut style.visuals.widgets.hovered,

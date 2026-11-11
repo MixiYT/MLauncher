@@ -2,7 +2,7 @@
 use crate::{
     java,
     model::{self, BuildIcon, Config, Profile},
-    ui::{self, Icon},
+    ui::{self, ComboAnimation, Icon},
 };
 use anyhow::{Context, Result};
 use eframe::egui::{self, RichText};
@@ -50,6 +50,7 @@ pub enum Action {
     Save,
     Close,
     Catalog(bool),
+    IdentifyMods,
     Changed,
 }
 pub struct Editor {
@@ -64,6 +65,8 @@ pub struct Editor {
     rename_text: String,
     remove: Option<PathBuf>,
     thumbnails: std::collections::HashMap<PathBuf, Option<egui::TextureHandle>>,
+    installed: Vec<model::InstalledMod>,
+    custom_icon: Option<(Vec<u8>, egui::TextureHandle)>,
     preview: Option<(PathBuf, egui::TextureHandle)>,
     status: String,
     error: bool,
@@ -82,6 +85,8 @@ impl Editor {
             rename_text: String::new(),
             remove: None,
             thumbnails: Default::default(),
+            installed: Vec::new(),
+            custom_icon: None,
             preview: None,
             status: String::new(),
             error: false,
@@ -103,11 +108,27 @@ impl Editor {
             .context("Сборка больше не существует")?;
         self.draft.name = self.draft.name.trim().to_owned();
         self.draft.java = self.custom_java.then(|| self.java.clone());
+        if self.draft.icon == BuildIcon::Custom {
+            if let Some((bytes, _)) = &self.custom_icon {
+                use std::io::Write;
+                let instance = config
+                    .game_root(root)
+                    .join("instances")
+                    .join(&self.directory);
+                let path = crate::icons::custom_path(&instance);
+                let folder = instance.join("launcher");
+                std::fs::create_dir_all(&folder)?;
+                let mut pending = tempfile::NamedTempFile::new_in(&folder)?;
+                pending.write_all(bytes)?;
+                pending.persist(path)?;
+            }
+        }
         config.profiles[index] = self.draft.clone();
         let renamed = config.sync_directory(index, root);
         self.directory = config.profiles[index].directory.clone();
         self.draft.directory = self.directory.clone();
         config.save(root)?;
+        self.custom_icon = None;
         self.status = if renamed {
             "Настройки сохранены"
         } else {
@@ -129,6 +150,10 @@ impl Editor {
                 self.error = true;
             }
         }
+    }
+
+    pub fn refresh_content(&mut self) {
+        self.refresh = true;
     }
     pub fn ui(
         &mut self,
@@ -189,10 +214,26 @@ impl Editor {
                     ui.label("Иконка сборки");
                     ui.horizontal_wrapped(|ui| {
                         for (preset, label) in BuildIcon::PRESETS {
-                            if ui::icon_tab(ui, preset.glyph(), label, self.draft.icon == preset)
-                                .clicked()
-                            {
+                            if ui::build_icon_tab(ui, preset, label, self.draft.icon == preset).clicked() {
                                 self.draft.icon = preset;
+                            }
+                        }
+                        if ui::build_icon_tab(ui, BuildIcon::Custom, "Загрузить свой значок…", self.draft.icon == BuildIcon::Custom).clicked() {
+                            if let Some(path) = rfd::FileDialog::new().add_filter("Изображения", &["png", "jpg", "jpeg", "webp", "bmp", "gif"]).pick_file() {
+                                match crate::icons::custom_image(&path) {
+                                    Ok((bytes, image)) => {
+                                        self.custom_icon = Some((bytes, ctx.load_texture("draft_build_icon", image, egui::TextureOptions::LINEAR)));
+                                        self.draft.icon = BuildIcon::Custom;
+                                    }
+                                    Err(error) => self.report(Err(error)),
+                                }
+                            }
+                        }
+                        if self.draft.icon == BuildIcon::Custom {
+                            let texture = self.custom_icon.as_ref().map(|(_, image)| image.clone())
+                                .or_else(|| crate::icons::custom_texture(ctx, instance));
+                            if let Some(texture) = texture {
+                                ui.add(egui::Image::new(&texture).fit_to_exact_size(egui::Vec2::splat(24.)));
                             }
                         }
                     });
@@ -222,7 +263,7 @@ impl Editor {
                         ui.checkbox(&mut self.java.fullscreen, "Полноэкранный режим");
                         egui::ComboBox::from_id_salt("instance_gc").selected_text(match self.java.collector {
                             java::Collector::Default => "GC: по умолчанию", java::Collector::G1 => "G1", java::Collector::Zgc => "ZGC", java::Collector::Shenandoah => "Shenandoah",
-                        }).show_ui(ui, |ui| {
+                        }).show_animated(ui, |ui| {
                             for (value, text) in [(java::Collector::Default, "По умолчанию"), (java::Collector::G1, "G1"), (java::Collector::Zgc, "ZGC"), (java::Collector::Shenandoah, "Shenandoah")] { ui.selectable_value(&mut self.java.collector, value, text); }
                         });
                         ui.label("JVM-аргументы, один на строку");
@@ -237,7 +278,13 @@ impl Editor {
                         self.report(std::fs::create_dir_all(&folder).map_err(Into::into).and_then(|_| open::that(&folder).map_err(Into::into)));
                     }
                     if matches!(self.tab, Tab::Mods | Tab::Resources) {
-                        if ui.button("Каталог").clicked() { action = Some(Action::Catalog(self.tab == Tab::Resources)); }
+                        let resources = self.tab == Tab::Resources;
+                        if ui.add_enabled(!blocked, egui::Button::new(if resources { "Каталог" } else { "Добавить моды" })).clicked() {
+                            action = Some(Action::Catalog(resources));
+                        }
+                        if !resources && ui.add_enabled(!blocked, egui::Button::new("Распознать JAR")).on_hover_text("Поиск метаданных на Modrinth по SHA-1").clicked() {
+                            action = Some(Action::IdentifyMods);
+                        }
                         if ui.add_enabled(!blocked, egui::Button::new("Импорт…")).clicked() {
                             let ext = if self.tab == Tab::Mods { "jar" } else { "zip" };
                             if let Some(paths) = rfd::FileDialog::new().add_filter("Minecraft", &[ext]).pick_files() {
@@ -252,6 +299,9 @@ impl Editor {
                 });
                 if self.refresh {
                     self.entries = list(&folder, self.tab);
+                    if self.tab == Tab::Mods {
+                        self.installed = model::installed(instance).unwrap_or_default();
+                    }
                     self.thumbnails.clear();
                     self.refresh = false;
                 }
@@ -330,7 +380,14 @@ impl Editor {
                                         } else { None };
                                         ui::catalog_thumbnail(ui, texture, fallback, 36.);
                                     }
-                                    ui.add(egui::Label::new(filename(&path)).truncate()).on_hover_text(path.display().to_string());
+                                    let file = filename(&path);
+                                    let original = file.strip_suffix(".disabled").unwrap_or(&file);
+                                    let item = (self.tab == Tab::Mods).then(|| self.installed.iter().find(|item| item.filename == original)).flatten();
+                                    ui.add(egui::Label::new(item.map_or(file.as_str(), |item| &item.name)).truncate())
+                                        .on_hover_text(item.filter(|item| !item.description.is_empty()).map_or_else(
+                                            || path.display().to_string(),
+                                            |item| format!("{file}\n{}", item.description),
+                                        ));
                                 });
                             });
                         });

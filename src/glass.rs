@@ -283,14 +283,19 @@ void main() {
     if (alpha <= 0.0) discard;
     vec2 uv = gl_FragCoord.xy / screen;
     vec2 direction = (p - halfSize) / max(halfSize, vec2(1.0));
-    float edge = pow(max(abs(direction.x), abs(direction.y)), 8.0);
-    uv += direction * edge * 3.0 / screen;
+    vec2 normal = sign(direction) * max(q, vec2(0.0));
+    normal /= max(length(normal), 1.0);
+    float rim = 1.0 - smoothstep(0.0, max(r, 1.0), -distance);
+    uv -= (normal + direction * 0.25) * rim * r * 0.66 / screen;
     vec3 blurred = vec3(0.0);
     float weights[5] = float[5](1.0, 4.0, 6.0, 4.0, 1.0);
-    vec2 stepSize = 1.5 / vec2(textureSize(scene, 0));
+    vec2 stepSize = mix(2.1, 0.8, rim) / vec2(textureSize(scene, 0));
     for (int y = -2; y <= 2; y++)
         for (int x = -2; x <= 2; x++)
             blurred += texture(scene, uv + vec2(x, y) * stepSize).rgb * weights[x+2] * weights[y+2];
-    color = vec4(blurred / 256.0 * alpha * opacity, alpha * opacity);
+    vec3 surface = blurred / 256.0;
+    float reflection = clamp(0.5 + direction.y * 0.4 - direction.x * 0.15, 0.0, 1.0);
+    surface = mix(surface, vec3(0.72, 0.83, 0.95), reflection * (0.07 + rim * 0.16));
+    color = vec4(surface * alpha * opacity, alpha * opacity);
 }
 "#;

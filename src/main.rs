@@ -40,7 +40,18 @@ use std::{
     path::PathBuf,
     sync::mpsc::{self, Receiver, Sender},
 };
-use ui::{icon_button, Icon};
+use ui::{icon_button, ComboAnimation, Icon};
+
+fn loader_label(loader: &str) -> &str {
+    match loader {
+        "vanilla" => "Vanilla",
+        "fabric" => "Fabric",
+        "forge" => "Forge",
+        "neoforge" => "NeoForge",
+        "quilt" => "Quilt",
+        _ => loader,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Page {
@@ -88,6 +99,7 @@ enum Event {
     Search(u64, usize, anyhow::Result<(String, Vec<Project>)>),
     Progress(String),
     Installed(anyhow::Result<usize>),
+    ModsIdentified(anyhow::Result<(usize, usize)>),
     Updated(anyhow::Result<bool>),
     Updates(anyhow::Result<Vec<(Source, String, Option<String>)>>),
     Auth(anyhow::Result<auth::Account>),
@@ -99,6 +111,7 @@ enum Event {
     Categories(Source, anyhow::Result<Vec<Category>>),
     JavaFound(Vec<java::Installation>),
     Game(u64, game::Event),
+    HorizonFinished(anyhow::Result<()>),
     Analysis(anyhow::Result<String>),
     AiDefaults(anyhow::Result<ai_gateway::Defaults>),
     AiKeysUploaded(anyhow::Result<()>),
@@ -151,12 +164,12 @@ struct Launcher {
     device: Option<microsoft::DevicePrompt>,
     version_list: Vec<versions::MinecraftVersion>,
     version_query: String,
+    favorites_only: bool,
     versions_loading: bool,
     versions_status: String,
     instance_version: Option<String>,
     instance_loader: String,
     instance_name: String,
-    instance_force_new: bool,
     search_options: SearchOptions,
     categories: std::collections::HashMap<Source, Vec<Category>>,
     categories_loading: std::collections::HashSet<Source>,
@@ -173,6 +186,7 @@ struct Launcher {
     java_searching: bool,
     game_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     game_running: bool,
+    horizon_running: bool,
     #[cfg(windows)]
     tray: tray::Tray,
     game_logs: std::collections::VecDeque<String>,
@@ -384,12 +398,12 @@ impl Launcher {
             device: None,
             version_list: vec![],
             version_query: String::new(),
+            favorites_only: false,
             versions_loading: false,
             versions_status: String::new(),
             instance_version: None,
             instance_loader: "fabric".into(),
             instance_name: String::new(),
-            instance_force_new: false,
             search_options: Default::default(),
             categories: Default::default(),
             categories_loading: Default::default(),
@@ -406,6 +420,7 @@ impl Launcher {
             java_searching: false,
             game_cancel: None,
             game_running: false,
+            horizon_running: false,
             #[cfg(windows)]
             tray: Default::default(),
             game_logs: Default::default(),
@@ -765,6 +780,56 @@ impl Launcher {
             ctx.request_repaint();
         });
     }
+
+    fn start_horizon(&mut self, ctx: &egui::Context) {
+        if self.horizon_running {
+            return;
+        }
+        let launcher = self.config.horizon.launcher.clone();
+        if !launcher.is_absolute() || !launcher.is_file() {
+            self.settings_tab = SettingsTab::Game;
+            self.navigate(Page::Settings);
+            self.result(
+                Err(anyhow::anyhow!(
+                    "Укажите установленный horizon-launcher.exe в настройках игры."
+                )),
+                "",
+            );
+            return;
+        }
+        let instance = self.config.horizon.instance.trim().to_owned();
+        let log_path = self.root.join("horizon-launch.log");
+        self.horizon_running = true;
+        self.result(Ok(()), "Запуск Minecraft 26.3 через Horizon…");
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<()> {
+                let log = std::fs::File::create(&log_path)?;
+                let mut command = std::process::Command::new(&launcher);
+                command.arg("play");
+                if !instance.is_empty() {
+                    command.arg("--instance").arg(instance);
+                }
+                let status = command
+                    .current_dir(launcher.parent().expect("absolute executable path"))
+                    .stdin(std::process::Stdio::null())
+                    .stdout(log.try_clone()?)
+                    .stderr(log)
+                    .status()?;
+                anyhow::ensure!(
+                    status.success(),
+                    "Horizon завершился с кодом {}. Журнал: {}",
+                    status
+                        .code()
+                        .map_or_else(|| "?".into(), |code| code.to_string()),
+                    log_path.display()
+                );
+                Ok(())
+            })();
+            let _ = tx.send(Event::HorizonFinished(result));
+            ctx.request_repaint();
+        });
+    }
     fn result(&mut self, result: anyhow::Result<()>, message: &str) {
         match result {
             Ok(()) => {
@@ -820,6 +885,7 @@ impl Launcher {
         }
         match self.config.select_instance(version, loader, name, force) {
             Ok(()) => {
+                self.config.horizon.selected = false;
                 // Папка создаётся сразу, чтобы сборка не исчезла при следующей проверке.
                 let _ = std::fs::create_dir_all(self.config.instance_dir(&self.root));
                 self.changed_instance()
@@ -1309,6 +1375,27 @@ impl Launcher {
                         Err(e) => self.result(Err(e), ""),
                     };
                     self.refresh_installed();
+                    if let Some(editor) = &mut self.build_editor {
+                        editor.refresh_content();
+                    }
+                }
+                Event::HorizonFinished(result) => {
+                    self.horizon_running = false;
+                    self.result(result, "Horizon завершил работу.");
+                }
+                Event::ModsIdentified(result) => {
+                    self.busy = false;
+                    match result {
+                        Ok((found, unmatched)) => self.result(
+                            Ok(()),
+                            &format!("Распознано модов: {found}. Без совпадения: {unmatched}."),
+                        ),
+                        Err(error) => self.result(Err(error), ""),
+                    }
+                    self.refresh_installed();
+                    if let Some(editor) = &mut self.build_editor {
+                        editor.refresh_content();
+                    }
                 }
                 Event::Updated(result) => {
                     self.busy = false;
@@ -1386,79 +1473,182 @@ impl Launcher {
     }
 
     fn launch_panel(&mut self, ui: &mut egui::Ui) {
+        let was_horizon = self.config.horizon.selected;
         let account = self
             .config
             .accounts
             .get(self.config.selected_account)
-            .map(|a| a.name.clone())
-            .unwrap_or_else(|| "Добавить аккаунт".into());
-        ui.horizontal(|ui| {
-            let response = if let Some(texture) = self
-                .config
-                .accounts
-                .get(self.config.selected_account)
-                .and_then(|a| self.avatars.get(a))
-            {
-                ui.add(egui::ImageButton::new(
-                    egui::Image::new(texture).fit_to_exact_size(Vec2::splat(24.)),
-                ))
-                .on_hover_text("Аккаунты")
-            } else {
-                icon_button(ui, Icon::User, "Аккаунты")
-            };
-            if response.clicked() {
-                self.toggle_page(Page::Accounts);
-            }
-            egui::ComboBox::from_id_salt("account")
-                .width(ui.available_width())
-                .truncate()
-                .selected_text(account)
-                .show_ui(ui, |ui| {
-                    let old = self.config.selected_account;
-                    for (i, a) in self.config.accounts.iter().enumerate() {
-                        ui.selectable_value(&mut self.config.selected_account, i, &a.name);
+            .map(|account| (account.kind, account.ely_skins, account.name.clone()));
+        if was_horizon {
+            ui.horizontal(|ui| {
+                if self.config.appearance.show_account_icons {
+                    ui::account_icons(ui, auth::AccountKind::Microsoft, false);
+                }
+                if ui
+                    .button("Аккаунт из Horizon")
+                    .on_hover_text("Вход выполняется в Horizon Launcher")
+                    .clicked()
+                {
+                    self.settings_tab = SettingsTab::Game;
+                    self.navigate(Page::Settings);
+                }
+            });
+        } else {
+            ui.horizontal(|ui| {
+                let response = if let Some(texture) = self
+                    .config
+                    .accounts
+                    .get(self.config.selected_account)
+                    .and_then(|a| self.avatars.get(a))
+                {
+                    ui.add(egui::ImageButton::new(
+                        egui::Image::new(texture).fit_to_exact_size(Vec2::splat(24.)),
+                    ))
+                    .on_hover_text("Аккаунты")
+                } else {
+                    icon_button(ui, Icon::User, "Аккаунты")
+                };
+                if response.clicked() {
+                    self.toggle_page(Page::Accounts);
+                }
+                if let Some((kind, ely_skins, _)) = &account {
+                    if self.config.appearance.show_account_icons {
+                        ui::account_icons(ui, *kind, *ely_skins);
                     }
-                    if old != self.config.selected_account {
-                        self.save();
-                    }
-                    if ui.button("+ Добавить аккаунт").clicked() {
-                        self.navigate(Page::Accounts);
-                    }
-                });
-        });
+                }
+                egui::ComboBox::from_id_salt("account")
+                    .width(ui.available_width())
+                    .truncate()
+                    .selected_text(
+                        account
+                            .as_ref()
+                            .map_or("Добавить аккаунт", |(_, _, name)| {
+                                name.as_str()
+                            }),
+                    )
+                    .show_animated(ui, |ui| {
+                        let old = self.config.selected_account;
+                        for (i, a) in self.config.accounts.iter().enumerate() {
+                            if ui
+                                .selectable_label(self.config.selected_account == i, &a.name)
+                                .clicked()
+                            {
+                                self.config.selected_account = i;
+                                ui.close_menu();
+                            }
+                        }
+                        if old != self.config.selected_account {
+                            self.save();
+                        }
+                        if ui.button("+ Добавить аккаунт").clicked() {
+                            self.navigate(Page::Accounts);
+                        }
+                    });
+            });
+        }
         let old = self.config.selected;
         ui.add_enabled_ui(
             !self.busy
                 && (self.game_cancel.is_none() || self.config.multi_session.enabled)
                 && !self.content_mutation_busy(),
             |ui| {
-                egui::ComboBox::from_id_salt("instance")
+                let profile = &self.config.profiles[self.config.selected];
+                let icon = if was_horizon {
+                    model::BuildIcon::Block
+                } else {
+                    profile.icon
+                };
+                let instance = self.config.instance_dir(&self.root);
+                let instances = self.config.game_root(&self.root).join("instances");
+                let has_icon =
+                    self.config.appearance.show_build_icons && icon != model::BuildIcon::None;
+                let name = if was_horizon {
+                    "Minecraft 26.3 · Horizon (Rust)"
+                } else {
+                    &profile.name
+                };
+                let response = egui::ComboBox::from_id_salt("instance")
                     .width(ui.available_width())
                     .truncate()
-                    .selected_text(&self.config.profiles[self.config.selected].name)
-                    .show_ui(ui, |ui| {
+                    .selected_text(if has_icon {
+                        format!("\u{2003}\u{2002}{name}")
+                    } else {
+                        name.to_owned()
+                    })
+                    .show_animated(ui, |ui| {
                         for (i, p) in self.config.profiles.iter().enumerate() {
-                            ui.selectable_value(&mut self.config.selected, i, &p.name);
+                            ui.horizontal(|ui| {
+                                if self.config.appearance.show_build_icons {
+                                    ui::build_thumbnail(
+                                        ui,
+                                        p.icon,
+                                        &instances.join(&p.directory),
+                                        18.,
+                                    );
+                                }
+                                if ui
+                                    .selectable_label(
+                                        !was_horizon && self.config.selected == i,
+                                        &p.name,
+                                    )
+                                    .clicked()
+                                {
+                                    self.config.selected = i;
+                                    self.config.horizon.selected = false;
+                                    ui.close_menu();
+                                }
+                            });
                         }
                         ui.separator();
+                        if ui
+                            .selectable_label(was_horizon, "Minecraft 26.3 · Horizon (Rust)")
+                            .clicked()
+                        {
+                            self.config.horizon.selected = true;
+                            ui.close_menu();
+                        }
                         if ui.button("Все версии…").clicked() {
                             self.navigate(Page::Versions);
+                            ui.close_menu();
                         }
                     });
+                if has_icon {
+                    let rect = response.response.rect;
+                    ui::paint_build_icon(
+                        ui,
+                        icon,
+                        &instance,
+                        egui::Rect::from_center_size(
+                            rect.left_center() + Vec2::new(ui.spacing().button_padding.x + 8., 0.),
+                            Vec2::splat(16.),
+                        ),
+                    );
+                }
             },
         );
         if old != self.config.selected {
             self.changed_instance();
+        } else if was_horizon != self.config.horizon.selected {
+            self.save();
         }
         ui.separator();
         ui.add_space((ui.available_height() - 88.).max(0.));
         if ui
-            .add_enabled_ui(!self.busy, |ui| {
-                ui.add_sized(
-                    [ui.available_width(), 48.],
-                    egui::Button::new(
-                        RichText::new(
-                            if self.game_cancel.is_some() && !self.config.multi_session.enabled {
+            .add_enabled_ui(
+                !self.busy && !(self.config.horizon.selected && self.horizon_running),
+                |ui| {
+                    ui.add_sized(
+                        [ui.available_width(), 48.],
+                        egui::Button::new(
+                            RichText::new(if self.config.horizon.selected {
+                                if self.horizon_running {
+                                    "Horizon запущен"
+                                } else {
+                                    "Запустить Horizon"
+                                }
+                            } else if self.game_cancel.is_some()
+                                && !self.config.multi_session.enabled
+                            {
                                 if self.game_running {
                                     "Остановить"
                                 } else {
@@ -1466,16 +1656,18 @@ impl Launcher {
                                 }
                             } else {
                                 "Запустить"
-                            },
-                        )
-                        .size(19.),
-                    ),
-                )
-            })
+                            })
+                            .size(19.),
+                        ),
+                    )
+                },
+            )
             .inner
             .clicked()
         {
-            if let Some(cancel) = self
+            if self.config.horizon.selected {
+                self.start_horizon(ui.ctx());
+            } else if let Some(cancel) = self
                 .game_cancel
                 .as_ref()
                 .filter(|_| !self.config.multi_session.enabled)
@@ -1823,7 +2015,7 @@ impl Launcher {
                         LibraryGroup::Catalog => "Каталог версий",
                         LibraryGroup::MyBuilds => "Мои сборки",
                     })
-                    .show_ui(ui, |ui| {
+                    .show_animated(ui, |ui| {
                         ui.selectable_value(group, LibraryGroup::Catalog, "Каталог версий");
                         ui.selectable_value(group, LibraryGroup::MyBuilds, "Мои сборки");
                     });
@@ -1844,6 +2036,32 @@ impl Launcher {
     }
 
     fn game_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        egui::CollapsingHeader::new("Minecraft 26.3 · Horizon (Rust)")
+            .default_open(self.config.horizon.selected && self.config.horizon.launcher.as_os_str().is_empty())
+            .show(ui, |ui| {
+            ui.label("Установите Horizon Launcher и войдите в Microsoft-аккаунт с Minecraft: Java Edition через него.");
+            ui.hyperlink_to("Сайт Horizon", "https://playhorizon.dev/");
+            let path = &mut self.config.horizon.launcher;
+            ui.add(egui::Label::new(path.display().to_string()).truncate());
+            let mut save = false;
+            if ui.button("Выбрать horizon-launcher.exe…").clicked() {
+                if let Some(selected) = rfd::FileDialog::new().add_filter("Приложение", &["exe"]).pick_file() {
+                    if selected.file_name().is_some_and(|name| name.eq_ignore_ascii_case("horizon-launcher.exe")) {
+                        *path = selected;
+                        save = true;
+                    } else {
+                        self.result(Err(anyhow::anyhow!("Выберите horizon-launcher.exe из установки Horizon.")), "");
+                    }
+                }
+            }
+            let response = ui.add(egui::TextEdit::singleline(&mut self.config.horizon.instance)
+                .desired_width(f32::INFINITY)
+                .hint_text("Профиль Horizon (пусто — активный)"));
+            if save || response.changed() {
+                self.save();
+            }
+        });
+        ui.separator();
         self.java_settings(ui, ctx);
         self.multiplayer_settings(ui);
         ui.separator();
@@ -1982,7 +2200,7 @@ impl Launcher {
         ui.add_enabled_ui(!self.config.multi_session.enabled, |ui| {
             let response = egui::ComboBox::from_id_salt("on_game_start")
                 .selected_text(modes.iter().find(|(value, _)| *value == mode).unwrap().1)
-                .show_ui(ui, |ui| {
+                .show_animated(ui, |ui| {
                     for (value, label) in modes {
                         ui.selectable_value(&mut self.config.on_game_start, value, label);
                     }
@@ -2018,7 +2236,7 @@ impl Launcher {
                 ui.label("Размер окна игры");ui.horizontal(|ui|{ui.add(egui::DragValue::new(&mut self.config.java.window_width).range(320..=7680));ui.label("×");ui.add(egui::DragValue::new(&mut self.config.java.window_height).range(240..=4320));});ui.end_row();
             });
             ui.checkbox(&mut self.config.java.fullscreen,"Полноэкранный режим");
-            egui::ComboBox::from_id_salt("collector").selected_text(match self.config.java.collector{java::Collector::Default=>"GC: по умолчанию",java::Collector::G1=>"GC: G1",java::Collector::Zgc=>"GC: ZGC (17+)",java::Collector::Shenandoah=>"GC: Shenandoah (17+, зависит от Java)"}).show_ui(ui,|ui|{
+            egui::ComboBox::from_id_salt("collector").selected_text(match self.config.java.collector{java::Collector::Default=>"GC: по умолчанию",java::Collector::G1=>"GC: G1",java::Collector::Zgc=>"GC: ZGC (17+)",java::Collector::Shenandoah=>"GC: Shenandoah (17+, зависит от Java)"}).show_animated(ui,|ui|{
                 ui.selectable_value(&mut self.config.java.collector,java::Collector::Default,"По умолчанию");ui.selectable_value(&mut self.config.java.collector,java::Collector::G1,"G1GC");ui.selectable_value(&mut self.config.java.collector,java::Collector::Zgc,"ZGC (Java 17+)");ui.selectable_value(&mut self.config.java.collector,java::Collector::Shenandoah,"Shenandoah (Java 17+)");
             });
             ui.collapsing("Дополнительные JVM-аргументы",|ui|{ui.label("Один аргумент на строку. Память задаётся выше; PermGen в Java 8+ отсутствует.");ui.add(egui::TextEdit::multiline(&mut self.config.java.extra_args).desired_width(f32::INFINITY).desired_rows(4));});
@@ -2041,6 +2259,42 @@ impl Launcher {
         if previous != self.config.appearance.interface_style {
             let result = self.config.save(&self.root);
             self.result(result, "");
+        }
+        let appearance = &mut self.config.appearance;
+        let mut changed = false;
+        ui.collapsing("Значки и поведение", |ui| {
+            for (value, label) in [
+                (
+                    &mut appearance.show_build_icons,
+                    "Значки сборок на главном экране",
+                ),
+                (
+                    &mut appearance.show_account_icons,
+                    "Значки сервисов на главном экране",
+                ),
+                (
+                    &mut appearance.animate_icons,
+                    "Анимация при нажатии на значки",
+                ),
+                (&mut appearance.animate_menus, "Анимация выпадающих списков"),
+                (
+                    &mut appearance.classic_title_bar,
+                    "Классическая верхняя панель",
+                ),
+                (
+                    &mut appearance.split_version_creation,
+                    "Раздельный выбор Vanilla и сборок с модами",
+                ),
+                (
+                    &mut appearance.colored_loader_icons,
+                    "Цветные значки загрузчиков",
+                ),
+            ] {
+                changed |= ui.checkbox(value, label).changed();
+            }
+        });
+        if changed {
+            self.save();
         }
         ui.separator();
         if variant::LITE {
@@ -2085,7 +2339,7 @@ impl Launcher {
         ui.label("Встроенный фон");
         egui::ComboBox::from_id_salt("background_effect")
             .selected_text(self.config.appearance.effect.label())
-            .show_ui(ui, |ui| {
+            .show_animated(ui, |ui| {
                 for effect in effects::Effect::ALL {
                     ui.selectable_value(&mut self.config.appearance.effect, effect, effect.label());
                 }
@@ -2223,7 +2477,7 @@ impl Launcher {
         });
         egui::ComboBox::from_id_salt("lite_effect")
             .selected_text(self.config.appearance.effect.label())
-            .show_ui(ui, |ui| {
+            .show_animated(ui, |ui| {
                 for effect in effects::Effect::LITE {
                     ui.selectable_value(&mut self.config.appearance.effect, effect, effect.label());
                 }
@@ -2412,9 +2666,21 @@ impl Launcher {
                     self.changed_instance();
                     self.resource_tab = resources;
                     self.maps_tab = false;
-                    self.installed_tab = !resources;
+                    self.installed_tab = false;
                     self.navigate(Page::Mods);
                 }
+            }
+            Some(instance::Action::IdentifyMods) => {
+                self.busy = true;
+                self.error = false;
+                self.status = "Поиск метаданных модов…".into();
+                let (tx, ctx) = (self.tx.clone(), ctx.clone());
+                std::thread::spawn(move || {
+                    let result =
+                        api::Api::new(String::new()).and_then(|api| api.identify_local_mods(&path));
+                    let _ = tx.send(Event::ModsIdentified(result));
+                    ctx.request_repaint();
+                });
             }
             None => {}
         }
@@ -2541,7 +2807,7 @@ impl Launcher {
                         break;
                     };
                     let name = profile.name.clone();
-                    let icon = profile.icon.glyph();
+                    let icon = profile.icon;
                     let version = profile.game_version.clone();
                     let loader = profile.loader.clone();
                     let directory = profile.directory.clone();
@@ -2561,7 +2827,16 @@ impl Launcher {
                             });
                         } else {
                             ui.horizontal(|ui| {
-                                ui::catalog_thumbnail(ui, None, icon, 24.);
+                                ui::build_thumbnail(
+                                    ui,
+                                    icon,
+                                    &self
+                                        .config
+                                        .game_root(&self.root)
+                                        .join("instances")
+                                        .join(&directory),
+                                    24.,
+                                );
                                 if ui
                                     .selectable_label(selected == index, &name)
                                     .on_hover_text("Сделать активной")
@@ -2749,30 +3024,44 @@ impl Launcher {
                 }
                 ui.strong(&version);
             });
-            egui::ComboBox::from_id_salt("loader")
-                .width(ui.available_width())
-                .truncate()
-                .selected_text(&self.instance_loader)
-                .show_ui(ui, |ui| {
-                    for loader in ["fabric", "forge", "neoforge", "quilt", "vanilla"] {
-                        ui.selectable_value(&mut self.instance_loader, loader.into(), loader);
-                    }
-                });
+            let official = self.config.appearance.colored_loader_icons;
+            ui.horizontal(|ui| {
+                ui::loader_icon(ui, &self.instance_loader, official);
+                egui::ComboBox::from_id_salt("loader")
+                    .width(ui.available_width())
+                    .truncate()
+                    .selected_text(loader_label(&self.instance_loader))
+                    .show_animated(ui, |ui| {
+                        for loader in ["vanilla", "fabric", "forge", "neoforge", "quilt"] {
+                            ui.horizontal(|ui| {
+                                ui::loader_icon(ui, loader, official);
+                                if ui
+                                    .selectable_label(
+                                        self.instance_loader == loader,
+                                        loader_label(loader),
+                                    )
+                                    .clicked()
+                                {
+                                    self.instance_loader = loader.into();
+                                    ui.close_menu();
+                                }
+                            });
+                        }
+                    });
+            });
             ui.add(
                 egui::TextEdit::singleline(&mut self.instance_name)
                     .min_size(Vec2::new(0., layout::ROW))
                     .hint_text("Название сборки (необязательно)"),
             );
-            ui.checkbox(&mut self.instance_force_new, "Отдельная копия сборки");
             if ui
                 .add_enabled(!self.busy, egui::Button::new("Добавить"))
                 .on_hover_text("Игра и загрузчик пока не устанавливаются")
                 .clicked()
             {
                 let (loader, name) = (self.instance_loader.clone(), self.instance_name.clone());
-                self.select_instance(&version, &loader, &name, self.instance_force_new);
+                self.select_instance(&version, &loader, &name, true);
                 self.instance_version = None;
-                self.instance_force_new = false;
                 self.navigate(if loader == "vanilla" {
                     Page::Home
                 } else {
@@ -2815,16 +3104,22 @@ impl Launcher {
                 self.load_versions(ctx);
             }
         });
+        ui.toggle_value(&mut self.favorites_only, "★ Избранное");
         if self.versions_loading {
             ui.spinner();
         }
         let mut selected = None;
         let mut modded = None;
-        let visible: Vec<_> = self
+        let favorites = &self.config.favorite_versions;
+        let mut toggle_favorite = None;
+        let mut visible: Vec<_> = self
             .version_list
             .iter()
             .filter(|v| versions::matches(v, &self.config.version_filters, &self.version_query))
+            .filter(|v| !self.favorites_only || favorites.contains(&v.id))
             .collect();
+        visible.sort_by_key(|v| !favorites.contains(&v.id));
+        let split_creation = self.config.appearance.split_version_creation;
         egui::ScrollArea::vertical()
             .id_salt("versions")
             .max_height((ui.available_height() - 40.).max(64.))
@@ -2833,9 +3128,10 @@ impl Launcher {
                 for i in rows {
                     let v = visible[i];
                     ui.push_id(&v.id, |ui| {
-                        let version_width = (ui.available_width() - 128.).max(100.);
+                        let actions_width = if split_creation { 174. } else { 128. };
+                        let version_width = (ui.available_width() - actions_width).max(54.);
                         egui::Grid::new("version_grid")
-                            .num_columns(3)
+                            .num_columns(if split_creation { 4 } else { 3 })
                             .spacing(Vec2::splat(layout::GRID))
                             .show(ui, |ui| {
                                 if ui
@@ -2846,24 +3142,49 @@ impl Launcher {
                                         )
                                     })
                                     .inner
-                                    .on_hover_text("Выбрать Vanilla")
+                                    .on_hover_text(if split_creation {
+                                        "Выбрать Vanilla"
+                                    } else {
+                                        "Создать сборку"
+                                    })
                                     .clicked()
                                 {
-                                    selected = Some(v.id.clone());
+                                    if split_creation {
+                                        selected = Some(v.id.clone());
+                                    } else {
+                                        modded = Some(v.id.clone());
+                                    }
                                 }
                                 ui.add_sized(
                                     [72., layout::ROW],
                                     egui::Label::new(RichText::new(v.kind.label()).small()),
                                 );
-                                if ui
-                                    .add_enabled_ui(!self.busy, |ui| {
-                                        icon_button(ui, Icon::Plus, "Создать сборку с модами")
-                                    })
-                                    .inner
-                                    .clicked()
+                                if split_creation
+                                    && ui
+                                        .add_enabled_ui(!self.busy, |ui| {
+                                            icon_button(ui, Icon::Plus, "Создать сборку с модами")
+                                        })
+                                        .inner
+                                        .clicked()
                                 {
                                     modded = Some(v.id.clone());
                                 }
+                                let favorite = favorites.contains(&v.id);
+                                if ui
+                                    .add_sized(
+                                        [36., layout::ROW],
+                                        egui::Button::new(if favorite { "★" } else { "☆" }),
+                                    )
+                                    .on_hover_text(if favorite {
+                                        "Убрать из избранного"
+                                    } else {
+                                        "В избранное"
+                                    })
+                                    .clicked()
+                                {
+                                    toggle_favorite = Some(v.id.clone());
+                                }
+                                ui.end_row();
                             });
                     });
                 }
@@ -2884,6 +3205,13 @@ impl Launcher {
         if let Some(v) = modded {
             self.instance_version = Some(v);
             self.instance_name.clear();
+            self.instance_loader = if split_creation { "fabric" } else { "vanilla" }.into();
+        }
+        if let Some(version) = toggle_favorite {
+            if !self.config.favorite_versions.remove(&version) {
+                self.config.favorite_versions.insert(version);
+            }
+            self.save();
         }
     }
 
@@ -3155,7 +3483,7 @@ impl Launcher {
                     .width(ui.available_width())
                     .truncate()
                     .selected_text(self.search_options.sort.label())
-                    .show_ui(ui, |ui| {
+                    .show_animated(ui, |ui| {
                         for sort in SortOrder::ALL {
                             ui.selectable_value(&mut self.search_options.sort, sort, sort.label());
                         }
@@ -3177,7 +3505,7 @@ impl Launcher {
                     .width(ui.available_width())
                     .truncate()
                     .selected_text(selected)
-                    .show_ui(ui, |ui| {
+                    .show_animated(ui, |ui| {
                         ui.selectable_value(
                             &mut self.search_options.category,
                             None,
@@ -4004,11 +4332,17 @@ impl Launcher {
             });
     }
     fn title_bar(&mut self, ctx: &egui::Context) {
+        let classic = self.config.appearance.classic_title_bar;
         egui::TopBottomPanel::top("custom_titlebar")
             .exact_height(38.)
+            .show_separator_line(classic)
             .frame(
                 egui::Frame::new()
-                    .fill(ctx.style().visuals.window_fill)
+                    .fill(if classic {
+                        ctx.style().visuals.window_fill
+                    } else {
+                        Color32::TRANSPARENT
+                    })
                     .inner_margin(egui::Margin::symmetric(10, 3)),
             )
             .show(ctx, |ui| {
@@ -4020,9 +4354,17 @@ impl Launcher {
                 let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
                 ui.horizontal(|ui| {
                     if let Some(brand) = &self.brand {
-                        ui.add(egui::Image::new(brand).fit_to_exact_size(Vec2::splat(24.)));
+                        ui.add(
+                            egui::Image::new(brand).fit_to_exact_size(Vec2::splat(if classic {
+                                24.
+                            } else {
+                                30.
+                            })),
+                        );
                     }
-                    ui.label(variant::NAME);
+                    if classic {
+                        ui.label(variant::NAME);
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui::icon_button_size(ui, Icon::Close, "Закрыть", Vec2::new(32., 28.))
                             .clicked()
@@ -4138,7 +4480,6 @@ impl Launcher {
             .refresh(&self.config.accounts, &self.cache_root, ctx);
         self.avatars.drain(ctx);
         self.thumbnails.drain(ctx);
-        self.title_bar(ctx);
         if self.config.appearance != self.applied_appearance {
             if self.config.appearance.background != self.applied_appearance.background {
                 self.background.load(
@@ -4151,7 +4492,25 @@ impl Launcher {
             self.config.appearance.apply(ctx);
             self.applied_appearance = self.config.appearance.clone();
         }
-        let mut custom_background = false;
+        let mut wallpaper_rect = ctx.screen_rect();
+        if self.config.appearance.classic_title_bar {
+            wallpaper_rect.min.y += 38.;
+        }
+        let mut wallpaper = egui::Ui::new(
+            ctx.clone(),
+            egui::Id::new("wallpaper"),
+            egui::UiBuilder::new()
+                .layer_id(egui::LayerId::background())
+                .max_rect(wallpaper_rect),
+        );
+        wallpaper.set_clip_rect(wallpaper_rect);
+        let time = if self.config.appearance.animate {
+            ctx.input(|i| i.time) as f32
+        } else {
+            0.
+        };
+        let custom_background = self.paint_wallpaper(&wallpaper, time);
+        self.title_bar(ctx);
         let mut background_click = false;
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
@@ -4164,33 +4523,36 @@ impl Launcher {
                         egui::Sense::click(),
                     )
                     .clicked();
-                let time = if self.config.appearance.animate {
-                    ctx.input(|i| i.time) as f32
-                } else {
-                    0.
-                };
-                custom_background = self.background.paint(ui);
-                let effect_allowed =
-                    !variant::LITE || self.config.appearance.effect.lite_supported();
-                if !custom_background
-                    && self.config.appearance.background.is_empty()
-                    && effect_allowed
-                {
-                    effects::paint(ui, time, &self.config.appearance);
-                } else if !custom_background {
-                    ui.painter()
-                        .rect_filled(ui.max_rect(), 0., ui.visuals().window_fill);
-                }
-                ui.painter().rect_filled(
-                    ui.max_rect(),
-                    0.,
-                    Color32::from_black_alpha(self.config.appearance.dim),
-                );
-                if self.config.appearance.interface_style == appearance::InterfaceStyle::LiquidGlass
-                {
-                    self.glass.capture(ui);
-                }
             });
+        self.render_workspace(ctx, custom_background, background_click)
+    }
+
+    fn paint_wallpaper(&mut self, ui: &egui::Ui, time: f32) -> bool {
+        let custom_background = self.background.paint(ui);
+        let effect_allowed = !variant::LITE || self.config.appearance.effect.lite_supported();
+        if !custom_background && self.config.appearance.background.is_empty() && effect_allowed {
+            effects::paint(ui, time, &self.config.appearance);
+        } else if !custom_background {
+            ui.painter()
+                .rect_filled(ui.max_rect(), 0., ui.visuals().window_fill);
+        }
+        ui.painter().rect_filled(
+            ui.max_rect(),
+            0.,
+            Color32::from_black_alpha(self.config.appearance.dim),
+        );
+        if self.config.appearance.interface_style == appearance::InterfaceStyle::LiquidGlass {
+            self.glass.capture(ui);
+        }
+        custom_background
+    }
+
+    fn render_workspace(
+        &mut self,
+        ctx: &egui::Context,
+        custom_background: bool,
+        background_click: bool,
+    ) -> egui::Rect {
         if background_click {
             self.close_pages();
         }

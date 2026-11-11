@@ -3,7 +3,7 @@ use crate::{
     media,
     model::{Config, Profile, SortOrder},
     packs::{Entry, Provider, Service, Version},
-    ui::{self, Icon},
+    ui::{self, ComboAnimation, Icon},
 };
 use eframe::egui;
 use std::{
@@ -417,7 +417,7 @@ impl Content {
         let mut search_now = false;
         ui.add_enabled_ui(!self.mutation_busy(),|ui|{
             ui.horizontal(|ui|{
-                egui::ComboBox::from_id_salt("content_provider").width(120.).selected_text(self.provider.label()).show_ui(ui,|ui|{
+                egui::ComboBox::from_id_salt("content_provider").width(120.).selected_text(self.provider.label()).show_animated(ui,|ui|{
                     for p in Provider::ALL {
                         if maps && p != Provider::CurseForge || resources&&!matches!(p,Provider::Modrinth|Provider::CurseForge){continue;}
                         if ui.selectable_value(&mut self.provider,p,p.label()).changed(){self.entries.clear();self.selected=None;self.status.clear();if !p.supports_sort(self.sort){self.sort=SortOrder::Relevance;}}
@@ -428,7 +428,7 @@ impl Content {
             });
             let old_sort=self.sort;
             ui.horizontal(|ui|{
-                egui::ComboBox::from_id_salt("content_sort").width((ui.available_width()-48.).max(80.)).selected_text(self.sort.label()).show_ui(ui,|ui|{
+                egui::ComboBox::from_id_salt("content_sort").width((ui.available_width()-48.).max(80.)).selected_text(self.sort.label()).show_animated(ui,|ui|{
                     for sort in SortOrder::ALL {ui.add_enabled_ui(self.provider.supports_sort(sort),|ui|{ui.selectable_value(&mut self.sort,sort,sort.label());});}
                 });
                 if !matches!(self.provider,Provider::Modrinth|Provider::CurseForge){ui::icon_button(ui,Icon::Info,"Сортировка среди найденных результатов. Недоступные режимы не поддерживаются API этого каталога.");}
@@ -447,7 +447,7 @@ impl Content {
                         if ui::icon_button(ui,Icon::Close,"Закрыть выбор версии").clicked(){self.selected=None;}
                     });
                     if self.versions.is_empty(){ui.label("Нет доступных версий");return;}
-                    egui::ComboBox::from_id_salt("pack_version").width(ui.available_width()).truncate().selected_text(&self.versions[self.version].name).show_ui(ui,|ui|{for(i,v)in self.versions.iter().enumerate(){ui.selectable_value(&mut self.version,i,&v.name);}});
+                    egui::ComboBox::from_id_salt("pack_version").width(ui.available_width()).truncate().selected_text(&self.versions[self.version].name).show_animated(ui,|ui|{for(i,v)in self.versions.iter().enumerate(){ui.selectable_value(&mut self.version,i,&v.name);}});
                     ui.horizontal(|ui|{
                         if !resources {ui.checkbox(&mut self.confirm,"Доверяю источнику").on_hover_text("Сборка содержит исполняемые Java-моды. Продолжайте только для доверенного источника.");}
                         if ui.add_enabled_ui((resources||self.confirm)&&!blocked&&!self.busy,|ui|ui::icon_button(ui,Icon::Download,if resources{"Скачать ресурспак"}else{"Установить отдельной сборкой"})).inner.clicked(){

@@ -1,0 +1,6 @@
+Official loader logos are used to identify the respective projects.
+
+Fabric: https://github.com/FabricMC/fabricmc.net/blob/main/assets/logo.png
+Forge: https://github.com/MinecraftForge/MinecraftForge/blob/26.3/src/main/resources/forge_logo.png
+NeoForge: https://github.com/neoforged/NeoForge/blob/26.3.x/src/main/resources/neoforge_logo.png
+Quilt: https://github.com/QuiltMC/quiltmc.org/blob/main/public/assets/img/logo-square.png

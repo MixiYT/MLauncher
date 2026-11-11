@@ -135,6 +135,91 @@ impl Api {
                 .collect(),
         })
     }
+
+    pub fn identify_local_mods(&self, instance: &Path) -> Result<(usize, usize)> {
+        let mut installed = model::installed(instance)?;
+        let mut unknown = Vec::new();
+        let mods = instance.join("mods");
+        if !mods.is_dir() {
+            return Ok((0, 0));
+        }
+        for entry in std::fs::read_dir(mods)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let filename = name.strip_suffix(".disabled").unwrap_or(name);
+            if model::safe_filename(filename).is_err()
+                || installed
+                    .iter()
+                    .any(|item| item.filename.eq_ignore_ascii_case(filename))
+                || model::mod_path(instance, filename)? != entry.path()
+            {
+                continue;
+            }
+            let mut digest = sha1::Sha1::new();
+            std::io::copy(&mut std::fs::File::open(entry.path())?, &mut digest)?;
+            unknown.push((filename.to_owned(), format!("{:x}", digest.finalize())));
+        }
+        let mut count = 0;
+        let mut projects = std::collections::HashMap::new();
+        for batch in unknown.chunks(100) {
+            let hashes: Vec<_> = batch.iter().map(|(_, hash)| hash).collect();
+            let versions: Value = self
+                .client
+                .post(format!("{MR}/version_files"))
+                .timeout(Duration::from_secs(30))
+                .json(&json!({ "algorithm": "sha1", "hashes": hashes }))
+                .send()?
+                .error_for_status()?
+                .json()?;
+            for (filename, hash) in batch {
+                let version = &versions[hash];
+                let (Some(id), Some(version_id)) =
+                    (version["project_id"].as_str(), version["id"].as_str())
+                else {
+                    continue;
+                };
+                if installed
+                    .iter()
+                    .any(|item| item.source == Source::Modrinth && item.project_id == id)
+                {
+                    continue;
+                }
+                if !projects.contains_key(id) {
+                    projects.insert(id.to_owned(), self.modrinth_project(id)?);
+                }
+                let project = &projects[id];
+                // A file edited during the lookup must not receive metadata for its old bytes.
+                let path = model::mod_path(instance, filename)?;
+                if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+                    continue;
+                }
+                let mut digest = sha1::Sha1::new();
+                std::io::copy(&mut std::fs::File::open(path)?, &mut digest)?;
+                if format!("{:x}", digest.finalize()) != *hash {
+                    continue;
+                }
+                installed.push(InstalledMod {
+                    source: Source::Modrinth,
+                    project_id: id.into(),
+                    version_id: version_id.into(),
+                    filename: filename.clone(),
+                    name: project.name.clone(),
+                    icon_url: project.icon_url.clone(),
+                    description: project.description.clone(),
+                    categories: project.categories.clone(),
+                });
+                count += 1;
+            }
+        }
+        if count > 0 {
+            save_manifest(instance, &installed)?;
+        }
+        Ok((count, unknown.len() - count))
+    }
     pub fn categories(&self, source: Source) -> Result<Vec<Category>> {
         let response = match source {
             Source::Modrinth => self.get(&format!("{MR}/tag/category"), &[], source)?,

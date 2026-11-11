@@ -106,45 +106,53 @@ pub fn paint(ui: &egui::Ui, time: f32, effect: Effect, light: bool) {
             }
         }
         Effect::CrystalCave => {
-            for i in 0..42 {
+            let floor = |x: f32| 0.81 + (x * 11.).sin() * 0.052 + (x * 31.).cos() * 0.02;
+            for i in 0..48 {
                 let n = i as f32;
-                let h = 0.12 + (n * 0.78).sin().abs() * 0.14;
-                let stone = if i % 3 == 0 {
-                    Color32::from_rgb(49, 58, 75)
-                } else {
-                    Color32::from_rgb(40, 48, 64)
-                };
-                p.rect_filled(rect(n / 42., 0., 1. / 42. + 0.001, h), 0., stone);
-                p.rect_filled(
-                    rect(n / 42., 0.87 - h * 0.3, 1. / 42. + 0.001, 0.3),
-                    0.,
-                    stone,
+                let x = n / 48.;
+                let width = 1. / 48. + 0.001;
+                let ceiling = 0.17 + (x * 9.).cos() * 0.08 + (x * 28.).sin() * 0.04;
+                let stone = mix(
+                    sky,
+                    Color32::from_rgb(91, 97, 132),
+                    0.21 + (n * 0.7).sin().abs() * 0.08,
                 );
+                let edge = mix(stone, sky, 0.42);
+                p.rect_filled(rect(x, 0., width, ceiling + 0.04), 0., edge);
+                p.rect_filled(rect(x, 0., width, ceiling), 0., stone);
+                p.rect_filled(rect(x, floor(x), width, 1. - floor(x)), 0., edge);
+                p.rect_filled(rect(x, floor(x) + 0.035, width, 1. - floor(x)), 0., stone);
             }
-            for i in 0..12 {
+            for i in 0..9 {
                 let n = i as f32;
-                let x = (n * 0.381).fract();
-                let y = 0.83 + (n * 0.71).sin() * 0.04;
-                let height = 0.055 + (n * 0.43).sin().abs() * 0.09;
+                let x = 0.06 + ((n * 0.381).fract()) * 0.91;
+                let y = floor(x) + 0.02;
+                let pulse = (time * 0.9 + n).sin() * 0.06 + 0.82;
                 let c = if i % 2 == 0 {
-                    Color32::from_rgb(88, 157, 170)
+                    Color32::from_rgb(93, 185, 209)
                 } else {
-                    Color32::from_rgb(128, 104, 180)
+                    Color32::from_rgb(163, 114, 226)
                 };
-                let tip = at(x, y - height);
-                let left = at(x - 0.012, y - height * 0.65);
-                let bottom = at(x, y);
-                let right = at(x + 0.013, y - height * 0.65);
-                p.add(egui::Shape::convex_polygon(
-                    vec![tip, left, bottom],
-                    mix(c, sky, 0.28),
-                    Stroke::NONE,
-                ));
-                p.add(egui::Shape::convex_polygon(
-                    vec![tip, bottom, right],
-                    c,
-                    Stroke::NONE,
-                ));
+                for shard in [-1., 1., 0.] {
+                    let width = 0.009 + (n * 0.7).sin().abs() * 0.004;
+                    let height =
+                        (0.07 + (n * 0.69).sin().abs() * 0.09) * (1. - 0.44 * f32::abs(shard));
+                    let axis = x + shard * 0.013;
+                    let tip = at(axis + shard * 0.021, y - height);
+                    let left = at(axis - width + shard * 0.013, y - height * 0.7);
+                    let right = at(axis + width + shard * 0.013, y - height * 0.7);
+                    let bottom = at(axis, y);
+                    p.add(egui::Shape::convex_polygon(
+                        vec![tip, left, at(axis - width * 0.65, y), bottom],
+                        mix(sky, c, pulse * 0.59),
+                        Stroke::NONE,
+                    ));
+                    p.add(egui::Shape::convex_polygon(
+                        vec![tip, bottom, at(axis + width * 0.65, y), right],
+                        mix(sky, c, pulse),
+                        Stroke::NONE,
+                    ));
+                }
             }
             for i in 0..35 {
                 let n = i as f32;
@@ -203,11 +211,15 @@ pub fn paint(ui: &egui::Ui, time: f32, effect: Effect, light: bool) {
             }
         }
         Effect::EndIslands => {
-            for i in 0..9 {
+            for i in 0..8 {
                 let n = i as f32;
-                let x = (n * 0.381).fract();
-                let y = 0.46 + (n * 0.73).sin() * 0.17;
-                let w = 0.06 + (n * 0.45).sin().abs() * 0.07;
+                let x = 0.03 + (n * 0.381).fract() * 0.94;
+                let y = 0.24 + n * 0.07 + (time * 0.27 + n * 2.).sin() * 0.012;
+                let w = 0.035 + n * 0.015;
+                let stone = Color32::from_rgb(172, 167, 116);
+                let top_color = mix(sky, stone, 0.35 + n * 0.069);
+                let front = mix(top_color, sky, 0.34);
+                let side = mix(top_color, sky, 0.53);
                 let top = vec![
                     at(x - w, y),
                     at(x - w * 0.5, y - 0.025),
@@ -216,26 +228,44 @@ pub fn paint(ui: &egui::Ui, time: f32, effect: Effect, light: bool) {
                     at(x + w * 0.35, y + 0.02),
                     at(x - w * 0.7, y + 0.02),
                 ];
+                p.add(egui::Shape::convex_polygon(top, top_color, Stroke::NONE));
                 p.add(egui::Shape::convex_polygon(
-                    top,
-                    Color32::from_rgb(157, 160, 108),
+                    vec![
+                        at(x - w * 0.7, y + 0.02),
+                        at(x - w * 0.08, y + 0.02),
+                        at(x + w * 0.08, y + w * 0.9),
+                        at(x - w * 0.34, y + w * 0.68),
+                    ],
+                    front,
                     Stroke::NONE,
                 ));
                 p.add(egui::Shape::convex_polygon(
                     vec![
-                        at(x - w * 0.7, y + 0.02),
+                        at(x - w * 0.08, y + 0.02),
                         at(x + w * 0.35, y + 0.02),
-                        at(x + w * 0.1, y + 0.08),
-                        at(x - w * 0.3, y + 0.11),
+                        at(x + w, y),
+                        at(x + w * 0.68, y + w * 0.53),
+                        at(x + w * 0.08, y + w * 0.9),
                     ],
-                    Color32::from_rgb(103, 101, 72),
+                    side,
                     Stroke::NONE,
                 ));
-                if i % 3 == 0 {
+                if i >= 4 && i % 2 == 1 {
+                    let height = 0.085 + n * 0.011;
                     p.rect_filled(
-                        rect(x - 0.01, y - 0.17, 0.02, 0.17),
+                        rect(x - 0.01, y - height, 0.019, height),
                         0.,
-                        Color32::from_rgb(38, 30, 49),
+                        mix(sky, Color32::from_rgb(42, 34, 57), 0.78),
+                    );
+                    p.rect_filled(
+                        rect(x - 0.01, y - height, 0.006, height),
+                        0.,
+                        Color32::from_rgb(53, 43, 64),
+                    );
+                    p.circle_filled(
+                        at(x, y - height - 0.012),
+                        2.2 + (time * 2. + n).sin() * 0.9,
+                        Color32::from_rgb(230, 151, 227),
                     );
                 }
             }

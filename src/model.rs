@@ -30,6 +30,14 @@ pub enum BuildIcon {
     Landscape,
     Home,
     Folder,
+    Star,
+    Shield,
+    Swords,
+    Pickaxe,
+    Compass,
+    Lightning,
+    None,
+    Custom,
     #[default]
     #[serde(other)]
     Box,
@@ -121,6 +129,14 @@ pub enum OnGameStart {
     Close,
 }
 
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HorizonSettings {
+    pub selected: bool,
+    pub launcher: PathBuf,
+    pub instance: String,
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LibraryGroup {
     #[default]
@@ -158,6 +174,8 @@ pub struct Config {
     #[serde(default = "default_version_filters")]
     pub version_filters: [bool; 4],
     #[serde(default)]
+    pub favorite_versions: std::collections::BTreeSet<String>,
+    #[serde(default)]
     pub assistant: crate::assistant::Settings,
     #[serde(default)]
     pub multi_session: MultiSession,
@@ -165,6 +183,8 @@ pub struct Config {
     pub curseforge_manual: bool,
     #[serde(default)]
     pub on_game_start: OnGameStart,
+    #[serde(default)]
+    pub horizon: HorizonSettings,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -226,6 +246,7 @@ impl Default for Config {
             game_directory: String::new(),
             java: Default::default(),
             version_filters: default_version_filters(),
+            favorite_versions: Default::default(),
             assistant: crate::assistant::Settings {
                 use_shared: true,
                 ..Default::default()
@@ -233,6 +254,7 @@ impl Default for Config {
             multi_session: Default::default(),
             curseforge_manual: false,
             on_game_start: OnGameStart::default(),
+            horizon: HorizonSettings::default(),
         }
     }
 }
@@ -625,13 +647,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let config = Config {
             version_filters: [false, true, false, true],
+            favorite_versions: ["1.21.1".into(), "26.3".into()].into(),
             ..Default::default()
         };
         config.save(root.path()).unwrap();
-        assert_eq!(
-            Config::load(root.path()).unwrap().version_filters,
-            [false, true, false, true]
-        );
+        let loaded = Config::load(root.path()).unwrap();
+        assert_eq!(loaded.version_filters, [false, true, false, true]);
+        assert_eq!(loaded.favorite_versions, config.favorite_versions);
     }
     #[test]
     fn legacy_config_accepts_new_microsoft_setting() {

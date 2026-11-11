@@ -16,9 +16,11 @@ pub enum Effect {
     CrystalCave,
     Nether,
     EndIslands,
+    Rain,
+    Orbits,
 }
 impl Effect {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 13] = [
         Self::Landscape,
         Self::None,
         Self::Bubbles,
@@ -30,6 +32,8 @@ impl Effect {
         Self::CrystalCave,
         Self::Nether,
         Self::EndIslands,
+        Self::Rain,
+        Self::Orbits,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -44,15 +48,24 @@ impl Effect {
             Self::CrystalCave => "Кристальная пещера",
             Self::Nether => "Базальт и лава",
             Self::EndIslands => "Острова Края",
+            Self::Rain => "Тихий дождь",
+            Self::Orbits => "Орбиты",
         }
     }
     pub fn lite_supported(self) -> bool {
         matches!(
             self,
-            Self::None | Self::Waves | Self::Bubbles | Self::Aurora
+            Self::None | Self::Waves | Self::Bubbles | Self::Aurora | Self::Rain | Self::Orbits
         )
     }
-    pub const LITE: [Self; 4] = [Self::None, Self::Waves, Self::Bubbles, Self::Aurora];
+    pub const LITE: [Self; 6] = [
+        Self::None,
+        Self::Waves,
+        Self::Bubbles,
+        Self::Aurora,
+        Self::Rain,
+        Self::Orbits,
+    ];
 }
 
 pub fn paint(ui: &egui::Ui, time: f32, appearance: &crate::appearance::Appearance) {
@@ -175,6 +188,41 @@ pub fn paint(ui: &egui::Ui, time: f32, appearance: &crate::appearance::Appearanc
                         Stroke::new(0.7_f32, color),
                     );
                 }
+            }
+        }
+        Effect::Rain => {
+            for i in 0..56 {
+                let n = i as f32;
+                let speed = 0.09 + (n % 7.) * 0.013;
+                let y = (n * 0.414 + time * speed).rem_euclid(1.18) - 0.09;
+                let x = ((n * 0.618).fract() - y * 0.045).rem_euclid(1.);
+                let drop = Vec2::new(-5., 14. + (n % 6.) * 4.);
+                p.line_segment(
+                    [at(x, y), at(x, y) + drop],
+                    Stroke::new(1_f32, tint(30 + (i % 5) * 13)),
+                );
+            }
+        }
+        Effect::Orbits => {
+            let radius = r.width().min(r.height());
+            for i in 0..8 {
+                let n = i as f32;
+                let point = |angle: f32| {
+                    r.center()
+                        + Vec2::new(angle.cos(), angle.sin() * 0.66) * radius * (0.24 + n * 0.075)
+                };
+                let ellipse = (0..64)
+                    .map(|segment| point(segment as f32 / 64. * std::f32::consts::TAU))
+                    .collect();
+                p.add(egui::Shape::closed_line(
+                    ellipse,
+                    Stroke::new(1_f32, tint(31 + i * 5)),
+                ));
+                p.circle_filled(
+                    point(n * 2.14 + time * (0.22 - n * 0.015)),
+                    2. + n % 3.,
+                    tint(120),
+                );
             }
         }
         Effect::None

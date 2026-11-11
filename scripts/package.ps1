@@ -30,7 +30,7 @@ $exe = Join-Path $targetRoot "$profile\mlauncher.exe"
 if (-not (Test-Path $exe)) { throw "Release EXE not found: $exe" }
 
 $dist = Join-Path $root 'dist'
-$temporaryRoot = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Temp\opencode'
+$temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) 'mlauncher-package'
 $stage = Join-Path $temporaryRoot ("package-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
@@ -41,6 +41,7 @@ $readme = if ($Lite) { 'README-Lite.md' } else { 'README.md' }
 Copy-Item (Join-Path $root $readme) (Join-Path $stage 'README.md')
 if (-not $Lite) { Copy-Item (Join-Path $root 'README-Lite.md') $stage }
 Copy-Item (Join-Path $root 'LICENSE') $stage
+Copy-Item (Join-Path $root 'assets\loaders\NOTICE.txt') (Join-Path $stage 'NOTICE-Loader-Logos.txt')
 if (-not $Lite) {
     Copy-Item (Join-Path $root 'native\bin\mlauncher-overlay.dll') $stage
     Copy-Item (Join-Path $root 'native\bin\LICENSE-*.txt') $stage

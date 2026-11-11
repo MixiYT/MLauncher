@@ -1,6 +1,6 @@
-﻿[package]
+[package]
 name = "mlauncher"
-version = "0.3.13"
+version = "0.3.14"
 edition = "2021"
 description = "Rust Minecraft launcher with modpacks, resourcepacks and launch diagnostics"
 license = "MIT"

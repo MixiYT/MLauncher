@@ -30,16 +30,29 @@ pub enum Icon {
     Resources,
     Exchange,
     Upload,
+    Star,
+    Shield,
+    Swords,
+    Pickaxe,
+    Compass,
+    Lightning,
 }
 
 impl crate::model::BuildIcon {
-    pub const PRESETS: [(Self, &'static str); 6] = [
+    pub const PRESETS: [(Self, &'static str); 13] = [
+        (Self::None, "Без значка"),
         (Self::Box, "Коробка"),
         (Self::Block, "Блок"),
         (Self::Mods, "Моды"),
         (Self::Landscape, "Пейзаж"),
         (Self::Home, "Дом"),
         (Self::Folder, "Папка"),
+        (Self::Star, "Звезда"),
+        (Self::Shield, "Щит"),
+        (Self::Swords, "Мечи"),
+        (Self::Pickaxe, "Кирка"),
+        (Self::Compass, "Компас"),
+        (Self::Lightning, "Молния"),
     ];
 
     pub fn glyph(self) -> Icon {
@@ -50,6 +63,14 @@ impl crate::model::BuildIcon {
             Self::Landscape => Icon::Resources,
             Self::Home => Icon::Home,
             Self::Folder => Icon::Folder,
+            Self::Star => Icon::Star,
+            Self::Shield => Icon::Shield,
+            Self::Swords => Icon::Swords,
+            Self::Pickaxe => Icon::Pickaxe,
+            Self::Compass => Icon::Compass,
+            Self::Lightning => Icon::Lightning,
+            Self::None => Icon::Close,
+            Self::Custom => Icon::Resources,
         }
     }
 }
@@ -112,6 +133,131 @@ pub fn icon_button(ui: &mut egui::Ui, icon: Icon, tooltip: &str) -> Response {
     icon_button_size(ui, icon, tooltip, Vec2::new(40., 32.))
 }
 
+pub fn build_thumbnail(
+    ui: &mut egui::Ui,
+    icon: crate::model::BuildIcon,
+    instance: &std::path::Path,
+    size: f32,
+) {
+    if icon != crate::model::BuildIcon::None {
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+        paint_build_icon(ui, icon, instance, rect);
+    }
+}
+
+pub fn paint_build_icon(
+    ui: &egui::Ui,
+    icon: crate::model::BuildIcon,
+    instance: &std::path::Path,
+    rect: Rect,
+) {
+    if icon == crate::model::BuildIcon::Custom {
+        if let Some(texture) = crate::icons::custom_texture(ui.ctx(), instance) {
+            egui::Image::new(&texture).paint_at(ui, rect);
+            return;
+        }
+    }
+    paint_icon(ui, icon.glyph(), rect, ui.visuals().text_color());
+}
+
+pub fn account_icons(ui: &mut egui::Ui, kind: crate::auth::AccountKind, ely_skins: bool) {
+    use crate::auth::AccountKind;
+    let (icon, label) = match kind {
+        AccountKind::Offline => (Icon::User, "Офлайн"),
+        AccountKind::ElyBy => (Icon::Ely, "Ely.by"),
+        AccountKind::Microsoft => (Icon::Microsoft, "Microsoft"),
+    };
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(16.), Sense::hover());
+    paint_icon(ui, icon, rect, ui.visuals().text_color());
+    response.on_hover_text(label);
+    if kind == AccountKind::Offline && ely_skins {
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(16.), Sense::hover());
+        paint_icon(ui, Icon::Ely, rect, ui.visuals().text_color());
+        response.on_hover_text("Скины Ely.by");
+    }
+}
+
+pub fn loader_icon(ui: &mut egui::Ui, loader: &str, official: bool) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(26., 18.), Sense::hover());
+    if official {
+        if let Some(texture) = crate::icons::loader_texture(ui, loader) {
+            let image = egui::Image::new(&texture)
+                .max_size(rect.size())
+                .maintain_aspect_ratio(true);
+            let size = image.calc_size(rect.size(), Some(texture.size_vec2()));
+            image.paint_at(ui, Rect::from_center_size(rect.center(), size));
+            return;
+        }
+    }
+    let rect = Rect::from_center_size(rect.center(), Vec2::splat(16.));
+    let at = |x: f32, y: f32| rect.min + Vec2::new(x, y) * 16.;
+    let stroke = Stroke::new(1.45_f32, ui.visuals().text_color());
+    let line = |points: &[(f32, f32)], closed| {
+        let points = points.iter().map(|&(x, y)| at(x, y)).collect();
+        ui.painter().add(if closed {
+            egui::Shape::closed_line(points, stroke)
+        } else {
+            egui::Shape::line(points, stroke)
+        });
+    };
+    match loader {
+        "fabric" => {
+            line(
+                &[(0.05, 0.33), (0.53, 0.08), (0.95, 0.29), (0.48, 0.55)],
+                true,
+            );
+            line(
+                &[
+                    (0.05, 0.34),
+                    (0.05, 0.66),
+                    (0.48, 0.92),
+                    (0.95, 0.64),
+                    (0.95, 0.29),
+                ],
+                false,
+            );
+            line(&[(0.48, 0.55), (0.48, 0.92)], false);
+        }
+        "forge" => line(
+            &[
+                (0.02, 0.2),
+                (0.98, 0.2),
+                (0.8, 0.42),
+                (0.59, 0.49),
+                (0.59, 0.62),
+                (0.75, 0.78),
+                (0.28, 0.78),
+                (0.43, 0.63),
+                (0.43, 0.49),
+                (0.18, 0.42),
+            ],
+            true,
+        ),
+        "neoforge" => {
+            line(
+                &[
+                    (0.1, 0.15),
+                    (0.42, 0.35),
+                    (0.58, 0.35),
+                    (0.9, 0.15),
+                    (0.84, 0.65),
+                    (0.5, 0.9),
+                    (0.16, 0.65),
+                ],
+                true,
+            );
+            line(&[(0.27, 0.52), (0.38, 0.61)], false);
+            line(&[(0.73, 0.52), (0.62, 0.61)], false);
+        }
+        "quilt" => {
+            line(&[(0.5, 0.04), (0.96, 0.5), (0.5, 0.96), (0.04, 0.5)], true);
+            line(&[(0.5, 0.04), (0.5, 0.96)], false);
+            line(&[(0.04, 0.5), (0.96, 0.5)], false);
+        }
+        _ => paint_icon(ui, Icon::Builds, rect, stroke.color),
+    }
+}
+
 pub fn icon_button_size(ui: &mut egui::Ui, icon: Icon, tooltip: &str, size: Vec2) -> Response {
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let visuals = ui.style().interact(&response);
@@ -125,10 +271,74 @@ pub fn icon_button_size(ui: &mut egui::Ui, icon: Icon, tooltip: &str, size: Vec2
     paint_icon(
         ui,
         icon,
-        Rect::from_center_size(rect.center(), Vec2::splat(21.)),
+        Rect::from_center_size(rect.center(), Vec2::splat(21. * icon_scale(ui, &response))),
         visuals.fg_stroke.color,
     );
     response.on_hover_text(tooltip)
+}
+
+fn icon_scale(ui: &egui::Ui, response: &Response) -> f32 {
+    if !ui.ctx().data(|data| {
+        data.get_temp(egui::Id::new("animate_icons"))
+            .unwrap_or(true)
+    }) {
+        return 1.;
+    }
+    let ctx = ui.ctx();
+    let id = response.id.with("icon_press");
+    let now = ctx.input(|input| input.time);
+    if response.clicked() {
+        ctx.data_mut(|data| data.insert_temp(id, now));
+    }
+    let press =
+        ctx.animate_bool_with_time(id.with("down"), response.is_pointer_button_down_on(), 0.09);
+    let click = ctx
+        .data(|data| data.get_temp::<f64>(id))
+        .map_or(1., |started| ((now - started) / 0.24).clamp(0., 1.) as f32);
+    if click < 1. {
+        ctx.request_repaint();
+    }
+    1. - press * 0.14 + (click * std::f32::consts::PI).sin() * 0.16
+}
+
+pub trait ComboAnimation {
+    fn show_animated<R>(
+        self,
+        ui: &mut egui::Ui,
+        menu: impl FnOnce(&mut egui::Ui) -> R,
+    ) -> egui::InnerResponse<Option<R>>;
+}
+
+impl ComboAnimation for egui::ComboBox {
+    fn show_animated<R>(
+        self,
+        ui: &mut egui::Ui,
+        menu: impl FnOnce(&mut egui::Ui) -> R,
+    ) -> egui::InnerResponse<Option<R>> {
+        self.show_ui(ui, |ui| {
+            let ctx = ui.ctx();
+            if ctx.data(|data| {
+                data.get_temp(egui::Id::new("animate_menus"))
+                    .unwrap_or(true)
+            }) {
+                let id = ui.id().with("popup_animation");
+                let frame = ctx.cumulative_pass_nr();
+                let now = ctx.input(|input| input.time);
+                let started = ctx.data_mut(|data| {
+                    let (last_frame, start) = data.get_temp::<(u64, f64)>(id).unwrap_or((0, now));
+                    let start = if frame > last_frame + 1 { now } else { start };
+                    data.insert_temp(id, (frame, start));
+                    start
+                });
+                let progress = ((now - started) / 0.16).clamp(0., 1.) as f32;
+                if progress < 1. {
+                    ctx.request_repaint();
+                }
+                ui.multiply_opacity(0.12 + 0.88 * (1. - (1. - progress).powi(3)));
+            }
+            menu(ui)
+        })
+    }
 }
 
 /// Shared fixed-height status row for all scrolling catalogs.
@@ -199,7 +409,31 @@ pub fn provider_button(ui: &mut egui::Ui, icon: Icon, text: &str) -> Response {
 }
 
 pub fn icon_tab(ui: &mut egui::Ui, icon: Icon, label: &str, selected: bool) -> Response {
-    tab_button(ui, Some(icon), label, selected)
+    tab_button(ui, Some(icon), None, label, selected)
+}
+
+pub fn build_icon_tab(
+    ui: &mut egui::Ui,
+    icon: crate::model::BuildIcon,
+    label: &str,
+    selected: bool,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(34.), Sense::click());
+    let visuals = ui.style().interact_selectable(&response, selected);
+    paint_surface(
+        ui,
+        rect,
+        visuals.corner_radius,
+        visuals.bg_fill,
+        visuals.bg_stroke,
+    );
+    paint_icon(
+        ui,
+        icon.glyph(),
+        Rect::from_center_size(rect.center(), Vec2::splat(18. * icon_scale(ui, &response))),
+        visuals.fg_stroke.color,
+    );
+    response.on_hover_text(label)
 }
 
 pub fn tab_value<T: PartialEq>(
@@ -208,7 +442,7 @@ pub fn tab_value<T: PartialEq>(
     selected: T,
     label: &str,
 ) -> Response {
-    let mut response = tab_button(ui, None, label, *value == selected);
+    let mut response = tab_button(ui, None, None, label, *value == selected);
     if response.clicked() && *value != selected {
         *value = selected;
         response.mark_changed();
@@ -216,7 +450,13 @@ pub fn tab_value<T: PartialEq>(
     response
 }
 
-fn tab_button(ui: &mut egui::Ui, icon: Option<Icon>, label: &str, selected: bool) -> Response {
+fn tab_button(
+    ui: &mut egui::Ui,
+    icon: Option<Icon>,
+    texture: Option<&egui::TextureHandle>,
+    label: &str,
+    selected: bool,
+) -> Response {
     use crate::appearance::InterfaceStyle;
     let galley = ui.painter().layout_no_wrap(
         label.to_owned(),
@@ -284,12 +524,15 @@ fn tab_button(ui: &mut egui::Ui, icon: Option<Icon>, label: &str, selected: bool
         visuals.fg_stroke.color
     };
     let text_x = if let Some(icon) = icon {
-        paint_icon(
-            ui,
-            icon,
-            Rect::from_center_size(rect.left_center() + Vec2::new(16., 0.), Vec2::splat(18.)),
-            color,
+        let icon_rect = Rect::from_center_size(
+            rect.left_center() + Vec2::new(16., 0.),
+            Vec2::splat(18. * icon_scale(ui, &response)),
         );
+        if let Some(texture) = texture {
+            egui::Image::new(texture).paint_at(ui, icon_rect);
+        } else {
+            paint_icon(ui, icon, icon_rect, color);
+        }
         30.
     } else {
         12.
@@ -323,6 +566,74 @@ pub fn paint_icon(ui: &egui::Ui, icon: Icon, rect: Rect, color: Color32) {
         );
     };
     match icon {
+        Icon::Star => {
+            let points = (0..10)
+                .map(|i| {
+                    let angle = i as f32 * std::f32::consts::PI / 5. - std::f32::consts::FRAC_PI_2;
+                    let radius = if i % 2 == 0 { 0.45 } else { 0.22 };
+                    at(0.5 + angle.cos() * radius, 0.53 + angle.sin() * radius)
+                })
+                .collect();
+            p.add(egui::Shape::closed_line(points, s));
+        }
+        Icon::Shield => {
+            p.add(egui::Shape::closed_line(
+                vec![
+                    at(0.5, 0.09),
+                    at(0.85, 0.24),
+                    at(0.82, 0.58),
+                    at(0.69, 0.78),
+                    at(0.5, 0.92),
+                    at(0.31, 0.78),
+                    at(0.18, 0.58),
+                    at(0.15, 0.24),
+                ],
+                s,
+            ));
+        }
+        Icon::Swords => {
+            line((0.16, 0.15), (0.87, 0.87));
+            line((0.84, 0.15), (0.13, 0.87));
+            line((0.61, 0.8), (0.8, 0.61));
+            line((0.2, 0.61), (0.39, 0.8));
+        }
+        Icon::Pickaxe => {
+            line((0.13, 0.88), (0.66, 0.35));
+            p.add(egui::Shape::line(
+                vec![
+                    at(0.25, 0.12),
+                    at(0.55, 0.18),
+                    at(0.81, 0.43),
+                    at(0.88, 0.73),
+                ],
+                s,
+            ));
+        }
+        Icon::Compass => {
+            p.circle_stroke(at(0.5, 0.5), rect.width() * 0.42, s);
+            p.add(egui::Shape::closed_line(
+                vec![
+                    at(0.71, 0.28),
+                    at(0.58, 0.58),
+                    at(0.29, 0.72),
+                    at(0.42, 0.42),
+                ],
+                s,
+            ));
+        }
+        Icon::Lightning => {
+            p.add(egui::Shape::closed_line(
+                vec![
+                    at(0.6, 0.08),
+                    at(0.21, 0.55),
+                    at(0.46, 0.55),
+                    at(0.38, 0.92),
+                    at(0.8, 0.42),
+                    at(0.54, 0.42),
+                ],
+                s,
+            ));
+        }
         Icon::Versions => {
             for y in [0.22, 0.5, 0.78] {
                 p.circle_filled(at(0.14, y), rect.width() * 0.04, color);
