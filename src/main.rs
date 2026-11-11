@@ -1567,14 +1567,12 @@ impl Launcher {
                 } else {
                     &profile.name
                 };
+                let icon_size = self.config.appearance.build_icon_size();
+                let selected_text = ui::combo_text(ui, name, has_icon.then_some(icon_size));
                 let response = egui::ComboBox::from_id_salt("instance")
                     .width(ui.available_width())
                     .truncate()
-                    .selected_text(if has_icon {
-                        format!("\u{2003}\u{2002}{name}")
-                    } else {
-                        name.to_owned()
-                    })
+                    .selected_text(selected_text)
                     .show_animated(ui, |ui| {
                         for (i, p) in self.config.profiles.iter().enumerate() {
                             ui.horizontal(|ui| {
@@ -1583,7 +1581,7 @@ impl Launcher {
                                         ui,
                                         p.icon,
                                         &instances.join(&p.directory),
-                                        18.,
+                                        icon_size,
                                     );
                                 }
                                 if ui
@@ -1619,8 +1617,9 @@ impl Launcher {
                         icon,
                         &instance,
                         egui::Rect::from_center_size(
-                            rect.left_center() + Vec2::new(ui.spacing().button_padding.x + 8., 0.),
-                            Vec2::splat(16.),
+                            rect.left_center()
+                                + Vec2::new(ui.spacing().button_padding.x + icon_size / 2., 0.),
+                            Vec2::splat(icon_size),
                         ),
                     );
                 }
@@ -2292,6 +2291,15 @@ impl Launcher {
             ] {
                 changed |= ui.checkbox(value, label).changed();
             }
+            changed |= ui
+                .add(
+                    egui::Slider::new(
+                        &mut appearance.build_icon_size,
+                        appearance::Appearance::BUILD_ICON_SIZES,
+                    )
+                    .text("Размер значков сборок"),
+                )
+                .changed();
         });
         if changed {
             self.save();
@@ -2835,7 +2843,7 @@ impl Launcher {
                                         .game_root(&self.root)
                                         .join("instances")
                                         .join(&directory),
-                                    24.,
+                                    self.config.appearance.build_icon_size(),
                                 );
                                 if ui
                                     .selectable_label(selected == index, &name)

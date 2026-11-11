@@ -145,6 +145,23 @@ pub fn build_thumbnail(
     }
 }
 
+pub fn combo_text(ui: &egui::Ui, name: &str, icon_size: Option<f32>) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let indent = icon_size.map_or(0., |size| size + ui.spacing().icon_spacing);
+    job.first_row_min_height = icon_size.unwrap_or_default();
+    job.append(
+        name,
+        indent,
+        egui::TextFormat {
+            font_id: egui::TextStyle::Button.resolve(ui.style()),
+            color: Color32::PLACEHOLDER,
+            valign: egui::Align::Center,
+            ..Default::default()
+        },
+    );
+    job
+}
+
 pub fn paint_build_icon(
     ui: &egui::Ui,
     icon: crate::model::BuildIcon,
@@ -902,6 +919,25 @@ pub fn category_fade(ui: &mut egui::Ui, key: impl std::hash::Hash, enabled: bool
 #[cfg(test)]
 mod category_tests {
     use super::*;
+    #[test]
+    fn build_selector_reserves_icon_space_without_extra_glyphs() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                for size in [None, Some(14.), Some(30.)] {
+                    let mut job = combo_text(ui, "Сборка с длинным названием", size);
+                    job.wrap = egui::text::TextWrapping::truncate_at_width(110.);
+                    let galley = ui.fonts(|fonts| fonts.layout_job(job));
+                    assert_eq!(galley.job.text, "Сборка с длинным названием");
+                    let first = &galley.rows[0].glyphs[0];
+                    assert_eq!(first.chr, 'С');
+                    assert!(first.pos.x >= size.unwrap_or_default());
+                    assert!(galley.size().y >= size.unwrap_or_default());
+                }
+            });
+        });
+    }
+
     #[test]
     fn category_fades_by_time_without_changing_layout_and_can_be_disabled() {
         let ctx = egui::Context::default();

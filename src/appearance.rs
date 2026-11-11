@@ -66,6 +66,7 @@ pub struct Appearance {
     pub light_background: bool,
     pub transitions: bool,
     pub show_build_icons: bool,
+    pub build_icon_size: u8,
     pub show_account_icons: bool,
     pub animate_icons: bool,
     pub animate_menus: bool,
@@ -87,6 +88,7 @@ impl Default for Appearance {
             light_background: false,
             transitions: true,
             show_build_icons: true,
+            build_icon_size: 18,
             show_account_icons: true,
             animate_icons: true,
             animate_menus: true,
@@ -97,6 +99,17 @@ impl Default for Appearance {
     }
 }
 impl Appearance {
+    pub const BUILD_ICON_SIZES: std::ops::RangeInclusive<u8> = 14..=30;
+
+    pub fn build_icon_size(&self) -> f32 {
+        self.build_icon_size
+            .clamp(
+                *Self::BUILD_ICON_SIZES.start(),
+                *Self::BUILD_ICON_SIZES.end(),
+            )
+            .into()
+    }
+
     pub fn accent_color(&self) -> Color32 {
         Color32::from_rgb(self.accent[0], self.accent[1], self.accent[2])
     }
