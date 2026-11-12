@@ -41,20 +41,24 @@ pub fn custom_texture(ctx: &egui::Context, instance: &Path) -> Option<egui::Text
     Some(texture)
 }
 
-pub fn loader_texture(ui: &egui::Ui, loader: &str) -> Option<egui::TextureHandle> {
-    let bytes: &[u8] = match loader {
-        "fabric" => include_bytes!("../assets/loaders/fabric.png"),
-        "forge" => include_bytes!("../assets/loaders/forge.png"),
-        "neoforge" => include_bytes!("../assets/loaders/neoforge.png"),
-        "quilt" => include_bytes!("../assets/loaders/quilt.png"),
+pub fn loader_texture(ui: &egui::Ui, loader: &str, official: bool) -> Option<egui::TextureHandle> {
+    let bytes: &[u8] = match (loader, official) {
+        ("fabric", true) => include_bytes!("../assets/loaders/fabric.png"),
+        ("forge", true) => include_bytes!("../assets/loaders/forge.png"),
+        ("neoforge", true) => include_bytes!("../assets/loaders/neoforge.png"),
+        ("quilt", true) => include_bytes!("../assets/loaders/quilt.png"),
+        ("fabric", false) => include_bytes!("../assets/loaders/fabric-mono.png"),
+        ("forge", false) => include_bytes!("../assets/loaders/forge-mono.png"),
+        ("neoforge", false) => include_bytes!("../assets/loaders/neoforge-mono.png"),
+        ("quilt", false) => include_bytes!("../assets/loaders/quilt-mono.png"),
         _ => return None,
     };
     let ctx = ui.ctx();
-    let id = egui::Id::new(("loader_texture", loader));
+    let id = egui::Id::new(("loader_texture", loader, official));
     if let Some(texture) = ctx.data(|data| data.get_temp(id)) {
         return Some(texture);
     }
-    let image = crate::media::decode_image(bytes, 128, 64).ok()?;
+    let image = crate::media::decode_image(bytes, 128, 128).ok()?;
     let texture = ctx.load_texture(loader, image, egui::TextureOptions::LINEAR);
     ctx.data_mut(|data| data.insert_temp(id, texture.clone()));
     Some(texture)

@@ -30,10 +30,10 @@
 
 ## Minecraft 26.3 через Horizon
 
-MLauncher может запустить Rust-клиент Minecraft через установленный [Horizon Launcher](https://playhorizon.dev/). Сначала войдите в Horizon с Microsoft-аккаунтом, на котором куплена Java Edition.
+MLauncher запускает Rust-клиент Minecraft через установленный [Semgas Horizon](https://gitlab.com/notehghewhd/semgas-horizon/-/releases). Для Ely.by войдите в аккаунт через настройки форка.
 
-1. В MLauncher откройте «Настройки → Игра → Minecraft 26.3 · Horizon (Rust)» и укажите `horizon-launcher.exe`.
-2. Если нужен конкретный профиль Horizon, введите его имя. Пустое поле использует активный профиль Horizon.
+1. В MLauncher откройте «Настройки → Игра → Minecraft 26.3 · Horizon (Rust)» и укажите исполняемый файл Horizon.
+2. При необходимости введите имя сохранённого аккаунта Ely.by и профиль Horizon. Пустые поля используют активный аккаунт и профиль в форке.
 3. В списке сборок на главном экране выберите «Minecraft 26.3 · Horizon (Rust)» и нажмите «Запустить Horizon».
 
 Horizon ведёт свои профили и устанавливает ресурсы игры. Моды Java Edition запускаются из Java-сборок MLauncher. Журнал команды запуска Horizon записывается в `horizon-launch.log` в папке данных MLauncher.

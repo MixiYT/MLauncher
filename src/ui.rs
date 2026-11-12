@@ -196,82 +196,24 @@ pub fn account_icons(ui: &mut egui::Ui, kind: crate::auth::AccountKind, ely_skin
 
 pub fn loader_icon(ui: &mut egui::Ui, loader: &str, official: bool) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(26., 18.), Sense::hover());
-    if official {
-        if let Some(texture) = crate::icons::loader_texture(ui, loader) {
-            let image = egui::Image::new(&texture)
-                .max_size(rect.size())
-                .maintain_aspect_ratio(true);
-            let size = image.calc_size(rect.size(), Some(texture.size_vec2()));
-            image.paint_at(ui, Rect::from_center_size(rect.center(), size));
-            return;
-        }
-    }
-    let rect = Rect::from_center_size(rect.center(), Vec2::splat(16.));
-    let at = |x: f32, y: f32| rect.min + Vec2::new(x, y) * 16.;
-    let stroke = Stroke::new(1.45_f32, ui.visuals().text_color());
-    let line = |points: &[(f32, f32)], closed| {
-        let points = points.iter().map(|&(x, y)| at(x, y)).collect();
-        ui.painter().add(if closed {
-            egui::Shape::closed_line(points, stroke)
-        } else {
-            egui::Shape::line(points, stroke)
-        });
-    };
-    match loader {
-        "fabric" => {
-            line(
-                &[(0.05, 0.33), (0.53, 0.08), (0.95, 0.29), (0.48, 0.55)],
-                true,
-            );
-            line(
-                &[
-                    (0.05, 0.34),
-                    (0.05, 0.66),
-                    (0.48, 0.92),
-                    (0.95, 0.64),
-                    (0.95, 0.29),
-                ],
-                false,
-            );
-            line(&[(0.48, 0.55), (0.48, 0.92)], false);
-        }
-        "forge" => line(
-            &[
-                (0.02, 0.2),
-                (0.98, 0.2),
-                (0.8, 0.42),
-                (0.59, 0.49),
-                (0.59, 0.62),
-                (0.75, 0.78),
-                (0.28, 0.78),
-                (0.43, 0.63),
-                (0.43, 0.49),
-                (0.18, 0.42),
-            ],
-            true,
-        ),
-        "neoforge" => {
-            line(
-                &[
-                    (0.1, 0.15),
-                    (0.42, 0.35),
-                    (0.58, 0.35),
-                    (0.9, 0.15),
-                    (0.84, 0.65),
-                    (0.5, 0.9),
-                    (0.16, 0.65),
-                ],
-                true,
-            );
-            line(&[(0.27, 0.52), (0.38, 0.61)], false);
-            line(&[(0.73, 0.52), (0.62, 0.61)], false);
-        }
-        "quilt" => {
-            line(&[(0.5, 0.04), (0.96, 0.5), (0.5, 0.96), (0.04, 0.5)], true);
-            line(&[(0.5, 0.04), (0.5, 0.96)], false);
-            line(&[(0.04, 0.5), (0.96, 0.5)], false);
-        }
-        _ => paint_icon(ui, Icon::Builds, rect, stroke.color),
+    if let Some(texture) = crate::icons::loader_texture(ui, loader, official) {
+        let image = egui::Image::new(&texture)
+            .max_size(rect.size())
+            .maintain_aspect_ratio(true)
+            .tint(if official || ui.visuals().dark_mode {
+                Color32::WHITE
+            } else {
+                ui.visuals().text_color()
+            });
+        let size = image.calc_size(rect.size(), Some(texture.size_vec2()));
+        image.paint_at(ui, Rect::from_center_size(rect.center(), size));
+    } else {
+        paint_icon(
+            ui,
+            Icon::Builds,
+            Rect::from_center_size(rect.center(), Vec2::splat(16.)),
+            ui.visuals().text_color(),
+        );
     }
 }
 

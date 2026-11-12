@@ -211,6 +211,8 @@ impl Editor {
             .auto_shrink([false, false]).show(ui, |ui| {
             if self.tab == Tab::General {
                 ui.add_enabled_ui(!blocked, |ui| {
+                    ui.checkbox(&mut self.draft.privacy.hide_mods, "Скрывать моды в интерфейсе");
+                    ui.checkbox(&mut self.draft.privacy.disable_logs, "Не собирать журнал в MLauncher");
                     ui.label("Иконка сборки");
                     ui.horizontal_wrapped(|ui| {
                         for (preset, label) in BuildIcon::PRESETS {
@@ -270,6 +272,8 @@ impl Editor {
                         ui.add(egui::TextEdit::multiline(&mut self.java.extra_args).desired_width(f32::INFINITY).desired_rows(4));
                     });
                 });
+            } else if self.tab == Tab::Mods && self.draft.privacy.hide_mods {
+                ui.label("Список модов скрыт настройками сборки.");
             } else {
                 let folder = instance.join(self.tab.folder());
                 ui.horizontal_wrapped(|ui| {

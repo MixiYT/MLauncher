@@ -53,8 +53,17 @@ pub struct Profile {
     /// Имя папки инстанса; совпадает с названием сборки, но очищено для файловой системы.
     #[serde(default)]
     pub directory: String,
+    #[serde(default)]
+    pub privacy: BuildPrivacy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub java: Option<crate::java::JavaSettings>,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BuildPrivacy {
+    pub hide_mods: bool,
+    pub disable_logs: bool,
 }
 
 /// Безопасное имя папки из названия сборки. Никаких разделителей и зарезервированных имён Windows.
@@ -135,6 +144,7 @@ pub struct HorizonSettings {
     pub selected: bool,
     pub launcher: PathBuf,
     pub instance: String,
+    pub account: String,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,6 +185,14 @@ pub struct Config {
     pub version_filters: [bool; 4],
     #[serde(default)]
     pub favorite_versions: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    pub favorites_only: bool,
+    #[serde(default)]
+    pub version_sort: crate::versions::Sort,
+    #[serde(default)]
+    pub reverse_versions: bool,
+    #[serde(default)]
+    pub version_launches: std::collections::BTreeMap<String, u64>,
     #[serde(default)]
     pub assistant: crate::assistant::Settings,
     #[serde(default)]
@@ -229,6 +247,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             profiles: vec![Profile {
+                privacy: Default::default(),
                 java: None,
                 icon: Default::default(),
                 name: "1.21.1 · Vanilla".into(),
@@ -247,6 +266,10 @@ impl Default for Config {
             java: Default::default(),
             version_filters: default_version_filters(),
             favorite_versions: Default::default(),
+            favorites_only: false,
+            version_sort: Default::default(),
+            reverse_versions: false,
+            version_launches: Default::default(),
             assistant: crate::assistant::Settings {
                 use_shared: true,
                 ..Default::default()
@@ -293,6 +316,7 @@ impl Config {
         };
         let directory = unique_directory(&name, self.profiles.iter().map(|p| p.directory.as_str()));
         self.profiles.push(Profile {
+            privacy: Default::default(),
             java: None,
             icon: Default::default(),
             name,

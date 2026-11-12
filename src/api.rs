@@ -258,7 +258,7 @@ impl Api {
         offset: usize,
         options: &SearchOptions,
     ) -> Result<Vec<Project>> {
-        let compatible_only = query.is_empty() && profile.loader != "vanilla";
+        let compatible_only = profile.loader != "vanilla";
         let mut facets = vec![vec!["project_type:mod".to_owned()]];
         if compatible_only {
             facets.push(vec![format!("versions:{}", profile.game_version)]);
@@ -292,6 +292,10 @@ impl Api {
                 if let Some(category) = &options.category {
                     params.push(("categoryId", category.clone()));
                 }
+                if compatible_only {
+                    params.push(("gameVersion", profile.game_version.clone()));
+                    params.push(("modLoaderType", loader_id(&profile.loader)?.into()));
+                }
                 self.get(&format!("{CF}/mods/search"), &params, source)?
             }
         };
@@ -305,7 +309,15 @@ impl Api {
             && list(&v["hits"])?.is_empty()
         {
             match self.get(&format!("{MR}/project/{query}"), &[], source) {
-                Ok(project) if project["project_type"] == "mod" => v["hits"] = json!([project]),
+                Ok(project)
+                    if project["project_type"] == "mod"
+                        && (!compatible_only
+                            || self
+                                .fetch_latest(source, &text(&project, "id"), profile)?
+                                .is_some()) =>
+                {
+                    v["hits"] = json!([project])
+                }
                 Ok(_) => {}
                 Err(error)
                     if error

@@ -54,6 +54,8 @@ using BindFramebufferFn=void(APIENTRY*)(GLenum,GLuint);
 static BindFramebufferFn bindFramebuffer=nullptr;
 static ImVec4 accentColor(0.47f,0.73f,0.67f,1.f);
 static bool lightStyle=false;
+static std::wstring themeName=L"Legacy";
+static std::wstring interfaceName=L"Standard";
 static int effectStyle=2; // 0 none, 1 waves, 2 bubbles, 3 aurora
 
 struct HttpHandle {
@@ -88,8 +90,20 @@ static void applyStyle() {
     style.WindowRounding=10.f;style.FrameRounding=5.f;style.TabRounding=4.f;
     style.WindowBorderSize=1.f;style.FrameBorderSize=0.f;style.WindowPadding=ImVec2(14,12);
     ImVec4* colors=style.Colors;
-    const ImVec4 base=lightStyle?ImVec4(.93f,.94f,.96f,.97f):ImVec4(.18f,.24f,.26f,.97f);
-    const ImVec4 frame=lightStyle?ImVec4(.85f,.88f,.91f,1):ImVec4(.27f,.31f,.32f,1);
+    ImVec4 base=lightStyle?ImVec4(.93f,.94f,.96f,.97f):ImVec4(.18f,.24f,.26f,.97f);
+    ImVec4 frame=lightStyle?ImVec4(.85f,.88f,.91f,1):ImVec4(.27f,.31f,.32f,1);
+    if(themeName==L"Dark"){base=ImVec4(.11f,.12f,.15f,.97f);frame=ImVec4(.18f,.19f,.23f,1.f);}
+    if(themeName==L"Amoled"){base=ImVec4(.016f,.016f,.028f,1.f);frame=ImVec4(.08f,.08f,.10f,1.f);}
+    if(interfaceName==L"Material"){
+        style.WindowRounding=18.f;style.FrameRounding=12.f;style.TabRounding=10.f;
+        style.WindowBorderSize=0.f;
+    }else if(interfaceName==L"LiquidGlass"){
+        style.WindowRounding=20.f;style.FrameRounding=14.f;style.TabRounding=12.f;
+        style.FrameBorderSize=1.f;base.w=.76f;frame.w=.68f;
+    }else if(interfaceName==L"Simple"){
+        style.WindowRounding=2.f;style.FrameRounding=2.f;style.TabRounding=2.f;
+        style.FrameBorderSize=1.f;base.w=1.f;
+    }
     const ImVec4 text=lightStyle?ImVec4(.12f,.14f,.18f,1):ImVec4(.84f,.86f,.88f,1);
     colors[ImGuiCol_WindowBg]=base;colors[ImGuiCol_ChildBg]=ImVec4(base.x,base.y,base.z,.55f);
     colors[ImGuiCol_PopupBg]=base;colors[ImGuiCol_Text]=text;colors[ImGuiCol_TextDisabled]=ImVec4(text.x,text.y,text.z,.55f);
@@ -346,7 +360,14 @@ static void drawOverlay() {
                 static bool follow=true;ImGui::Checkbox("Прокручивать вниз",&follow);
                 ImGui::BeginChild("logs",ImVec2(0,0),true,ImGuiWindowFlags_HorizontalScrollbar);
                 const bool atBottom=ImGui::GetScrollY()>=ImGui::GetScrollMaxY()-2.f;
-                for(const auto& line:snapshot.value("logs",json::array()))if(line.is_string())ImGui::TextUnformatted(line.get_ref<const std::string&>().c_str());
+                if(const auto logs=snapshot.find("logs");logs!=snapshot.end()&&logs->is_array()){
+                    ImGuiListClipper clipper;
+                    clipper.Begin(static_cast<int>(logs->size()),ImGui::GetTextLineHeightWithSpacing());
+                    while(clipper.Step())for(int row=clipper.DisplayStart;row<clipper.DisplayEnd;++row){
+                        const auto& line=(*logs)[row];
+                        ImGui::TextUnformatted(line.is_string()?line.get_ref<const std::string&>().c_str():"");
+                    }
+                }
                 if(follow&&atBottom)ImGui::SetScrollHereY(1.f);
                 ImGui::EndChild();ImGui::EndTabItem();
             }
@@ -502,6 +523,8 @@ static DWORD WINAPI initialize(void*) {
     wchar_t style[64]{};
     if(GetEnvironmentVariableW(L"MLAUNCHER_OVERLAY_ACCENT",style,64)){int r=0,g=0,b=0;if(swscanf_s(style,L"%d,%d,%d",&r,&g,&b)==3)accentColor=ImVec4(r/255.f,g/255.f,b/255.f,1.f);}
     if(GetEnvironmentVariableW(L"MLAUNCHER_OVERLAY_STYLE",style,64))lightStyle=wcscmp(style,L"light")==0;
+    if(GetEnvironmentVariableW(L"MLAUNCHER_OVERLAY_THEME",style,64))themeName=style;
+    if(GetEnvironmentVariableW(L"MLAUNCHER_OVERLAY_INTERFACE",style,64))interfaceName=style;
     if(GetEnvironmentVariableW(L"MLAUNCHER_OVERLAY_EFFECT",style,64)){
         if(wcscmp(style,L"Waves")==0)effectStyle=1;else if(wcscmp(style,L"Bubbles")==0)effectStyle=2;
         else if(wcscmp(style,L"Aurora")==0)effectStyle=3;else if(wcscmp(style,L"None")==0)effectStyle=0;

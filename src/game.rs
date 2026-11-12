@@ -575,10 +575,14 @@ fn progress_installer(
         .join("versions")
         .join(profile_id)
         .join(format!("{profile_id}.json"));
-    let log_dir = request.instance.join("launcher/logs");
-    fs::create_dir_all(&log_dir)?;
-    let log_path = log_dir.join("loader-installer.log");
-    let log = File::create(&log_path)?;
+    let log_path = request.instance.join("launcher/logs/loader-installer.log");
+    let (stdout, stderr) = if request.profile.privacy.disable_logs {
+        (Stdio::null(), Stdio::null())
+    } else {
+        fs::create_dir_all(request.instance.join("launcher/logs"))?;
+        let log = File::create(&log_path)?;
+        (Stdio::from(log.try_clone()?), Stdio::from(log))
+    };
     let mut command = java::java_command(&java);
     command
         .arg("-jar")
@@ -587,8 +591,8 @@ fn progress_installer(
         .arg(&request.storage)
         .current_dir(&request.storage)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(log.try_clone()?))
-        .stderr(Stdio::from(log));
+        .stdout(stdout)
+        .stderr(stderr);
     #[cfg(windows)]
     command.creation_flags(0x08000000);
     let mut child = command
@@ -608,6 +612,9 @@ fn progress_installer(
         std::thread::sleep(Duration::from_millis(100));
     };
     if !status.success() {
+        if request.profile.privacy.disable_logs {
+            bail!("Ошибка установщика загрузчика ({status})");
+        }
         bail!(
             "Ошибка установщика загрузчика. Журнал: {}",
             log_path.display()
@@ -1147,14 +1154,19 @@ pub fn run(
     let mut prepared = prepare(&request, &cancel, &|s| events(Event::Progress(s)))?;
     // Shared assets/libraries are locked only during installation, not during gameplay.
     FileExt::unlock(&lock)?;
-    let log_dir = request.instance.join("launcher/logs");
-    fs::create_dir_all(&log_dir)?;
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_millis();
-    let log = Arc::new(Mutex::new(File::create(
-        log_dir.join(format!("launch-{timestamp}.log")),
-    )?));
+    let capture_logs = !request.profile.privacy.disable_logs;
+    let log = Arc::new(Mutex::new(if capture_logs {
+        let log_dir = request.instance.join("launcher/logs");
+        fs::create_dir_all(&log_dir)?;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis();
+        Some(File::create(
+            log_dir.join(format!("launch-{timestamp}.log")),
+        )?)
+    } else {
+        None
+    }));
     downloads::check_cancel(&cancel)?;
     let mut command = java::java_command(&prepared.java);
     command
@@ -1162,6 +1174,8 @@ pub fn run(
         .env_remove("MLAUNCHER_OVERLAY_TOKEN")
         .env_remove("MLAUNCHER_OVERLAY_ACCENT")
         .env_remove("MLAUNCHER_OVERLAY_STYLE")
+        .env_remove("MLAUNCHER_OVERLAY_THEME")
+        .env_remove("MLAUNCHER_OVERLAY_INTERFACE")
         .env_remove("MLAUNCHER_OVERLAY_EFFECT")
         .env_remove("MLAUNCHER_OVERLAY_TEST")
         .env_remove("MLAUNCHER_OVERLAY_TEST_QUERY");
@@ -1185,7 +1199,12 @@ pub fn run(
                         "MLAUNCHER_OVERLAY_STYLE",
                         if options.light { "light" } else { "dark" },
                     )
-                    .env("MLAUNCHER_OVERLAY_EFFECT", &options.effect);
+                    .env("MLAUNCHER_OVERLAY_EFFECT", &options.effect)
+                    .env("MLAUNCHER_OVERLAY_THEME", format!("{:?}", options.theme))
+                    .env(
+                        "MLAUNCHER_OVERLAY_INTERFACE",
+                        format!("{:?}", options.interface_style),
+                    );
                 prepared
                     .secrets
                     .push(Zeroizing::new(bridge.secret().to_owned()));
@@ -1205,27 +1224,40 @@ pub fn run(
         .args(&prepared.args)
         .current_dir(&request.instance)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(if capture_logs {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stderr(if capture_logs {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
     let mut child = command.spawn().context("Не удалось запустить Minecraft")?;
     if let (Some(options), Some(bridge)) = (&request.overlay, &bridge) {
         let message=match crate::overlay::inject(&child,&options.dll){Ok(())=>"[Оверлей] DLL подключена. Shift+Tab после загрузки OpenGL. Vulkan не поддерживается.".into(),Err(e)=>format!("[Оверлей] Отключён для этой сессии: {e:#}")};
         bridge.log(&message);
-        if let Ok(mut log) = log.lock() {
-            let _ = writeln!(log, "{message}");
+        if let Ok(mut guard) = log.lock() {
+            if let Some(log) = guard.as_mut() {
+                let _ = writeln!(log, "{message}");
+            }
         }
         events(Event::Log(message));
     }
     events(Event::Started);
     let secrets = Arc::new(prepared.secrets);
     let (tx, rx) = mpsc::sync_channel::<String>(512);
-    let stdout = child.stdout.take().context("Нет stdout Java")?;
-    let stderr = child.stderr.take().context("Нет stderr Java")?;
     let mut threads = vec![];
-    for stream in [
-        Box::new(stdout) as Box<dyn Read + Send>,
-        Box::new(stderr) as Box<dyn Read + Send>,
-    ] {
+    let stdout = child
+        .stdout
+        .take()
+        .map(|stream| Box::new(stream) as Box<dyn Read + Send>);
+    let stderr = child
+        .stderr
+        .take()
+        .map(|stream| Box::new(stream) as Box<dyn Read + Send>);
+    for stream in [stdout, stderr].into_iter().flatten() {
         let (tx, secrets, log) = (tx.clone(), secrets.clone(), log.clone());
         threads.push(std::thread::spawn(move || {
             let mut reader = BufReader::new(stream);
@@ -1239,8 +1271,10 @@ pub fn run(
                     break;
                 }
                 let line = redact(String::from_utf8_lossy(&bytes).trim_end(), &secrets);
-                if let Ok(mut log) = log.lock() {
-                    let _ = writeln!(log, "{line}");
+                if let Ok(mut guard) = log.lock() {
+                    if let Some(log) = guard.as_mut() {
+                        let _ = writeln!(log, "{line}");
+                    }
                 }
                 let _ = tx.try_send(line);
             }
@@ -1251,8 +1285,10 @@ pub fn run(
         if let Some(bridge) = &bridge {
             if let Some(message) = bridge.take_status() {
                 let line = format!("[Оверлей] {message}");
-                if let Ok(mut log) = log.lock() {
-                    let _ = writeln!(log, "{line}");
+                if let Ok(mut guard) = log.lock() {
+                    if let Some(log) = guard.as_mut() {
+                        let _ = writeln!(log, "{line}");
+                    }
                 }
                 events(Event::Log(line));
             }
@@ -1307,6 +1343,7 @@ pub fn loader_smoke_test() -> Result<()> {
         let request = Request {
             overlay: None,
             profile: crate::model::Profile {
+                privacy: Default::default(),
                 java: None,
                 icon: Default::default(),
                 name: loader.into(),

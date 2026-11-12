@@ -157,6 +157,7 @@ pub fn apply(
                 .prefix(".ai-create-")
                 .tempdir_in(instances)?;
             let mut profile = Profile {
+                privacy: Default::default(),
                 name: name.trim().into(),
                 game_version: minecraft.clone(),
                 loader: loader.clone(),
@@ -464,6 +465,7 @@ mod tests {
 
     fn profile() -> Profile {
         Profile {
+            privacy: Default::default(),
             name: "Test".into(),
             game_version: "1.21.1".into(),
             loader: "fabric".into(),
@@ -644,6 +646,7 @@ mod live_tests {
         let outcome = apply(
             &plan,
             &Profile {
+                privacy: Default::default(),
                 name: "Existing".into(),
                 game_version: "1.21.1".into(),
                 loader: "vanilla".into(),

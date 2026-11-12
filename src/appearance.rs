@@ -73,6 +73,8 @@ pub struct Appearance {
     pub classic_title_bar: bool,
     pub split_version_creation: bool,
     pub colored_loader_icons: bool,
+    pub open_panel_limit: usize,
+    pub fill_workspace: bool,
 }
 impl Default for Appearance {
     fn default() -> Self {
@@ -95,6 +97,8 @@ impl Default for Appearance {
             classic_title_bar: false,
             split_version_creation: false,
             colored_loader_icons: false,
+            open_panel_limit: 4,
+            fill_workspace: false,
         }
     }
 }

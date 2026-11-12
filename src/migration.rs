@@ -370,6 +370,7 @@ pub fn import(build: &Build, instances: &Path, cancel: &AtomicBool) -> Result<Pr
     anyhow::ensure!(!target.exists(), "Папка сборки уже существует");
     fs::rename(stage.path(), &target).context("Не удалось сохранить импортированную сборку")?;
     Ok(Profile {
+        privacy: Default::default(),
         name: build.name.clone(),
         icon: Default::default(),
         game_version: build.minecraft.clone(),

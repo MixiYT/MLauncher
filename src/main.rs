@@ -136,6 +136,7 @@ struct Launcher {
     config: Config,
     page: Page,
     secondary_page: Option<Page>,
+    extra_pages: Vec<Page>,
     tx: Sender<Event>,
     rx: Receiver<Event>,
     busy: bool,
@@ -164,7 +165,6 @@ struct Launcher {
     device: Option<microsoft::DevicePrompt>,
     version_list: Vec<versions::MinecraftVersion>,
     version_query: String,
-    favorites_only: bool,
     versions_loading: bool,
     versions_status: String,
     instance_version: Option<String>,
@@ -303,6 +303,8 @@ impl PanelMotion {
 struct GameSession {
     id: u64,
     name: String,
+    version: String,
+    capture_logs: bool,
     instance: PathBuf,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     running: bool,
@@ -370,6 +372,7 @@ impl Launcher {
             config,
             page: Page::Home,
             secondary_page: None,
+            extra_pages: Vec::new(),
             tx,
             rx,
             busy: false,
@@ -398,7 +401,6 @@ impl Launcher {
             device: None,
             version_list: vec![],
             version_query: String::new(),
-            favorites_only: false,
             versions_loading: false,
             versions_status: String::new(),
             instance_version: None,
@@ -539,29 +541,46 @@ impl Launcher {
         self.account_totp.zeroize();
         if page == Page::Home {
             self.secondary_page = None;
+            self.extra_pages.clear();
+        } else {
+            if self.secondary_page == Some(page) {
+                self.secondary_page = self.extra_pages.pop();
+            }
+            self.extra_pages.retain(|open| *open != page);
         }
         self.page = page;
     }
     fn toggle_page(&mut self, page: Page) {
+        if let Some(index) = self.extra_pages.iter().position(|open| *open == page) {
+            self.extra_pages.remove(index);
+            return;
+        }
         if self.secondary_page == Some(page) {
-            self.secondary_page = None;
+            self.secondary_page = self.extra_pages.pop();
             return;
         }
         if self.page == page {
             let previous = self.secondary_page.take().unwrap_or(Page::Home);
+            self.secondary_page = self.extra_pages.pop();
             self.navigate(previous);
             return;
         }
-        if self.page != Page::Home && self.secondary_page.is_none() {
-            self.secondary_page = Some(self.page);
-            self.page = page;
-        } else {
-            self.navigate(page);
+        let limit = self.config.appearance.open_panel_limit.clamp(1, 7);
+        if self.page != Page::Home && limit > 1 {
+            if let Some(previous) = self.secondary_page.replace(self.page) {
+                self.extra_pages.push(previous);
+            }
+            if self.extra_pages.len() > limit - 2 {
+                self.extra_pages.remove(0);
+            }
         }
+        self.navigate(page);
     }
     fn toggle_library(&mut self, tab: VersionTab) {
         let tabs = self.config.library_tabs;
-        let open = self.page == Page::Versions || self.secondary_page == Some(Page::Versions);
+        let open = self.page == Page::Versions
+            || self.secondary_page == Some(Page::Versions)
+            || self.extra_pages.contains(&Page::Versions);
         let same_group = self.version_tab.group(tabs) == tab.group(tabs);
         if !open || !same_group {
             self.version_tab = tab;
@@ -576,6 +595,18 @@ impl Launcher {
     fn close_pages(&mut self) {
         self.navigate(Page::Home);
     }
+
+    fn focus_page(&mut self, page: Page) {
+        if page == self.page {
+            return;
+        }
+        if self.secondary_page == Some(page) {
+            self.secondary_page = Some(self.page);
+        } else if let Some(old) = self.extra_pages.iter_mut().find(|old| **old == page) {
+            *old = self.page;
+        }
+        self.page = page;
+    }
     fn panel_id_of(&self, page: Page) -> layout::PanelId {
         use layout::PanelId;
         match page {
@@ -586,7 +617,7 @@ impl Launcher {
             Page::Versions => PanelId::Versions,
             Page::Mods => PanelId::Mods,
             Page::About => PanelId::About,
-            Page::Logs => PanelId::About,
+            Page::Logs => PanelId::Logs,
             Page::Help => PanelId::Help,
             Page::BuildEdit => PanelId::Instance,
         }
@@ -606,7 +637,7 @@ impl Launcher {
             }
             Page::Mods => PanelId::Mods,
             Page::About => PanelId::About,
-            Page::Logs => PanelId::About,
+            Page::Logs => PanelId::Logs,
             Page::Help => PanelId::Help,
             Page::BuildEdit => PanelId::Instance,
         }
@@ -723,9 +754,7 @@ impl Launcher {
         {
             Some(overlay::Options::installed(
                 self.key.clone(),
-                self.config.appearance.accent,
-                self.config.appearance.light_background,
-                format!("{:?}", self.config.appearance.effect),
+                &self.config.appearance,
             ))
         } else {
             None
@@ -757,6 +786,8 @@ impl Launcher {
         self.sessions.push(GameSession {
             id,
             name: request.profile.name.clone(),
+            version: request.profile.game_version.clone(),
+            capture_logs: !request.profile.privacy.disable_logs,
             instance: request.instance.clone(),
             cancel: cancel.clone(),
             running: false,
@@ -791,13 +822,14 @@ impl Launcher {
             self.navigate(Page::Settings);
             self.result(
                 Err(anyhow::anyhow!(
-                    "Укажите установленный horizon-launcher.exe в настройках игры."
+                    "Укажите исполняемый файл Semgas Horizon в настройках игры."
                 )),
                 "",
             );
             return;
         }
         let instance = self.config.horizon.instance.trim().to_owned();
+        let account = self.config.horizon.account.trim().to_owned();
         let log_path = self.root.join("horizon-launch.log");
         self.horizon_running = true;
         self.result(Ok(()), "Запуск Minecraft 26.3 через Horizon…");
@@ -805,6 +837,15 @@ impl Launcher {
         std::thread::spawn(move || {
             let result = (|| -> anyhow::Result<()> {
                 let log = std::fs::File::create(&log_path)?;
+                if !account.is_empty() {
+                    let status = std::process::Command::new(&launcher)
+                        .args(["account", "select", &account])
+                        .stdin(std::process::Stdio::null())
+                        .stdout(log.try_clone()?)
+                        .stderr(log.try_clone()?)
+                        .status()?;
+                    anyhow::ensure!(status.success(), "Аккаунт не найден в Semgas Horizon. Войдите в Ely.by через форк. Журнал: {}", log_path.display());
+                }
                 let mut command = std::process::Command::new(&launcher);
                 command.arg("play");
                 if !instance.is_empty() {
@@ -928,6 +969,9 @@ impl Launcher {
             self.tx.clone(),
             ctx.clone(),
         );
+        let mut profile = profile;
+        profile.game_version =
+            versions::mod_catalog_version(&self.version_list, &profile.game_version).to_owned();
         let options = self.search_options.clone();
         let resolved = self.mod_browse.resolved_query.clone();
         std::thread::spawn(move || {
@@ -1238,6 +1282,13 @@ impl Launcher {
                 Event::Game(id, event) => match event {
                     game::Event::Progress(s) => self.launch_status = s,
                     game::Event::Log(line) => {
+                        if self
+                            .sessions
+                            .iter()
+                            .any(|session| session.id == id && !session.capture_logs)
+                        {
+                            continue;
+                        }
                         if self.game_logs.len() >= if variant::LITE { 500 } else { 1500 } {
                             self.game_logs.pop_front();
                         }
@@ -1246,6 +1297,15 @@ impl Launcher {
                     game::Event::Started => {
                         if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
                             session.running = true;
+                            let count = self
+                                .config
+                                .version_launches
+                                .entry(session.version.clone())
+                                .or_default();
+                            *count = count.saturating_add(1);
+                            if let Err(error) = self.config.save(&self.root) {
+                                self.result(Err(error), "");
+                            }
                         }
                         self.game_running = true;
                         self.launch_status = "Minecraft запущен".into();
@@ -2036,30 +2096,50 @@ impl Launcher {
 
     fn game_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::CollapsingHeader::new("Minecraft 26.3 · Horizon (Rust)")
-            .default_open(self.config.horizon.selected && self.config.horizon.launcher.as_os_str().is_empty())
+            .default_open(
+                self.config.horizon.selected && self.config.horizon.launcher.as_os_str().is_empty(),
+            )
             .show(ui, |ui| {
-            ui.label("Установите Horizon Launcher и войдите в Microsoft-аккаунт с Minecraft: Java Edition через него.");
-            ui.hyperlink_to("Сайт Horizon", "https://playhorizon.dev/");
-            let path = &mut self.config.horizon.launcher;
-            ui.add(egui::Label::new(path.display().to_string()).truncate());
-            let mut save = false;
-            if ui.button("Выбрать horizon-launcher.exe…").clicked() {
-                if let Some(selected) = rfd::FileDialog::new().add_filter("Приложение", &["exe"]).pick_file() {
-                    if selected.file_name().is_some_and(|name| name.eq_ignore_ascii_case("horizon-launcher.exe")) {
-                        *path = selected;
-                        save = true;
-                    } else {
-                        self.result(Err(anyhow::anyhow!("Выберите horizon-launcher.exe из установки Horizon.")), "");
+                ui.label(
+                    "Укажите лаунчер Semgas Horizon и войдите в аккаунт Ely.by в его настройках.",
+                );
+                ui.hyperlink_to(
+                    "Сборки Semgas Horizon для Windows и Linux",
+                    "https://gitlab.com/notehghewhd/semgas-horizon/-/releases",
+                );
+                let path = &mut self.config.horizon.launcher;
+                ui.add(egui::Label::new(path.display().to_string()).truncate());
+                let mut save = false;
+                if ui.button("Выбрать лаунчер Horizon…").clicked() {
+                    let dialog = rfd::FileDialog::new();
+                    #[cfg(windows)]
+                    let dialog = dialog.add_filter("Приложение", &["exe"]);
+                    if let Some(selected) = dialog.pick_file() {
+                        if selected.is_absolute() && selected.is_file() {
+                            *path = selected;
+                            save = true;
+                        } else {
+                            self.result(
+                                Err(anyhow::anyhow!("Выберите исполняемый файл Horizon.")),
+                                "",
+                            );
+                        }
                     }
                 }
-            }
-            let response = ui.add(egui::TextEdit::singleline(&mut self.config.horizon.instance)
-                .desired_width(f32::INFINITY)
-                .hint_text("Профиль Horizon (пусто — активный)"));
-            if save || response.changed() {
-                self.save();
-            }
-        });
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.config.horizon.instance)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Профиль Horizon (пусто — активный)"),
+                );
+                let account = ui.add(
+                    egui::TextEdit::singleline(&mut self.config.horizon.account)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Имя Ely.by в Horizon (пусто — активный)"),
+                );
+                if save || response.changed() || account.changed() {
+                    self.save();
+                }
+            });
         ui.separator();
         self.java_settings(ui, ctx);
         self.multiplayer_settings(ui);
@@ -2300,8 +2380,25 @@ impl Launcher {
                     .text("Размер значков сборок"),
                 )
                 .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut appearance.open_panel_limit, 1..=7)
+                        .text("Лимит открытых панелей"),
+                )
+                .changed();
+            changed |= ui
+                .checkbox(
+                    &mut appearance.fill_workspace,
+                    "Заполнять свободное место панелями",
+                )
+                .changed();
         });
         if changed {
+            let limit = self.config.appearance.open_panel_limit.clamp(1, 7);
+            self.extra_pages.truncate(limit.saturating_sub(2));
+            if limit == 1 {
+                self.secondary_page = None;
+            }
             self.save();
         }
         ui.separator();
@@ -3112,7 +3209,28 @@ impl Launcher {
                 self.load_versions(ctx);
             }
         });
-        ui.toggle_value(&mut self.favorites_only, "★ Избранное");
+        let mut preferences_changed = false;
+        ui.horizontal_wrapped(|ui| {
+            preferences_changed |= ui
+                .toggle_value(&mut self.config.favorites_only, "★ Избранное")
+                .changed();
+            egui::ComboBox::from_id_salt("version_sort")
+                .selected_text(self.config.version_sort.label())
+                .show_animated(ui, |ui| {
+                    for sort in versions::Sort::ALL {
+                        preferences_changed |= ui
+                            .selectable_value(&mut self.config.version_sort, sort, sort.label())
+                            .changed();
+                    }
+                });
+            preferences_changed |= ui
+                .toggle_value(&mut self.config.reverse_versions, "Обратный порядок")
+                .changed();
+        });
+        if preferences_changed {
+            let result = self.config.save(&self.root);
+            self.result(result, "");
+        }
         if self.versions_loading {
             ui.spinner();
         }
@@ -3120,12 +3238,35 @@ impl Launcher {
         let mut modded = None;
         let favorites = &self.config.favorite_versions;
         let mut toggle_favorite = None;
+        let filters = if self.config.favorites_only {
+            [true; 4]
+        } else {
+            self.config.version_filters
+        };
         let mut visible: Vec<_> = self
             .version_list
             .iter()
-            .filter(|v| versions::matches(v, &self.config.version_filters, &self.version_query))
-            .filter(|v| !self.favorites_only || favorites.contains(&v.id))
+            .filter(|v| versions::matches(v, &filters, &self.version_query))
+            .filter(|v| !self.config.favorites_only || favorites.contains(&v.id))
             .collect();
+        match self.config.version_sort {
+            versions::Sort::Date => {}
+            versions::Sort::Usage => visible.sort_by_cached_key(|v| {
+                std::cmp::Reverse(
+                    self.config
+                        .version_launches
+                        .get(&v.id)
+                        .copied()
+                        .unwrap_or_default(),
+                )
+            }),
+            versions::Sort::Alphabetical => {
+                visible.sort_by_cached_key(|v| v.id.to_ascii_lowercase())
+            }
+        }
+        if self.config.reverse_versions {
+            visible.reverse();
+        }
         visible.sort_by_key(|v| !favorites.contains(&v.id));
         let split_creation = self.config.appearance.split_version_creation;
         egui::ScrollArea::vertical()
@@ -3219,7 +3360,8 @@ impl Launcher {
             if !self.config.favorite_versions.remove(&version) {
                 self.config.favorite_versions.insert(version);
             }
-            self.save();
+            let result = self.config.save(&self.root);
+            self.result(result, "");
         }
     }
 
@@ -3294,6 +3436,10 @@ impl Launcher {
             ("mods", self.resource_tab, self.installed_tab, self.maps_tab),
             self.config.appearance.transitions,
         );
+        if self.config.profiles[self.config.selected].privacy.hide_mods && !self.resource_tab {
+            ui.label("Моды скрыты настройками сборки.");
+            return;
+        }
         if self.resource_tab {
             self.resource_catalog.set_section(if self.maps_tab {
                 content::Section::Maps
@@ -3316,6 +3462,11 @@ impl Launcher {
                 self.instance_name.clear();
                 self.navigate(Page::Versions);
             }
+        }
+        let selected_version = &self.config.profiles[self.config.selected].game_version;
+        let catalog_version = versions::mod_catalog_version(&self.version_list, selected_version);
+        if !self.installed_tab && catalog_version != selected_version {
+            ui.small(format!("Каталог для снапшота: релиз {catalog_version}. Установка проверяет {selected_version}."));
         }
         if let Some(item) = self.remove_candidate.clone() {
             ui.group(|ui| {
@@ -3815,6 +3966,9 @@ impl Launcher {
                 }
                 if ui.button("Журнал запуска").clicked(){self.navigate(Page::Logs);}
             },
+            Page::Logs if self.config.profiles[self.config.selected].privacy.disable_logs => {
+                ui.label("Сбор журнала MLauncher отключён для этой сборки.");
+            },
             Page::Logs=>{
                 if ui.button("Разобрать ошибку с ИИ").clicked(){self.prepare_ai_report();self.navigate(Page::Help);}
                 if ui.button("Открыть папку журналов").clicked(){let path=self.config.instance_dir(&self.root).join("launcher/logs");let result=std::fs::create_dir_all(&path).map_err(anyhow::Error::from).and_then(|_|open::that(path).map_err(Into::into));self.result(result,"");}
@@ -3934,6 +4088,10 @@ impl Launcher {
     }
     fn prepare_ai_report(&mut self) {
         let p = &self.config.profiles[self.config.selected];
+        if p.privacy.disable_logs {
+            self.ai_report.clear();
+            return;
+        }
         let lines = self
             .game_logs
             .iter()
@@ -4589,6 +4747,86 @@ impl Launcher {
         if let (Some(id), Some(rect)) = (detail, geometry.detail) {
             targets.push((id, real_page, rect));
         }
+        if detail.is_some()
+            && (self.config.appearance.fill_workspace || !self.extra_pages.is_empty())
+        {
+            let mut pages = vec![real_page];
+            for page in secondary
+                .into_iter()
+                .chain(self.extra_pages.iter().rev().copied())
+            {
+                if !pages
+                    .iter()
+                    .any(|open| self.panel_id_of(*open) == self.panel_id_of(page))
+                {
+                    pages.push(page);
+                }
+            }
+            let mut area = screen;
+            area.max.y -= 44.;
+            let tiles = layout::Geometry::tiled(area, pages.len() + 1);
+            let launcher_tile = tiles[tiles.len() - 1];
+            let size = self
+                .config
+                .panels
+                .get(layout::PanelId::Launcher)
+                .min(launcher_tile.size());
+            let launcher = if tiles.len() == 1 {
+                egui::Rect::from_center_size(
+                    egui::pos2(launcher_tile.center().x, launcher_tile.top() + size.y / 2.),
+                    size,
+                )
+            } else {
+                egui::Rect::from_center_size(launcher_tile.center(), size)
+            };
+            targets = vec![(layout::PanelId::Launcher, Page::Home, launcher)];
+            if tiles.len() == 1 {
+                let detail_rect = egui::Rect::from_min_max(
+                    egui::pos2(launcher_tile.left(), launcher.bottom() + layout::GAP),
+                    launcher_tile.max,
+                );
+                targets.push((self.panel_id_of(real_page), real_page, detail_rect));
+            } else {
+                targets.extend(
+                    pages
+                        .iter()
+                        .copied()
+                        .zip(tiles.iter().copied().take(tiles.len() - 1))
+                        .map(|(page, rect)| (self.panel_id_of(page), page, rect)),
+                );
+            }
+            egui::Area::new(egui::Id::new("open_workspace_pages"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::pos2(
+                    screen.left() + layout::GAP,
+                    screen.bottom() - 38.,
+                ))
+                .show(ctx, |ui| {
+                    egui::ScrollArea::horizontal()
+                        .max_width((screen.width() - 2. * layout::GAP).max(1.))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                for page in pages {
+                                    let label = match page {
+                                        Page::Accounts => "Аккаунты",
+                                        Page::Settings => "Настройки",
+                                        Page::Versions => "Версии и сборки",
+                                        Page::Mods => "Моды",
+                                        Page::About => "О проекте",
+                                        Page::Logs => "Журнал",
+                                        Page::Help => "ИИ-помощник",
+                                        Page::BuildEdit => "Редактор сборки",
+                                        Page::Home => "Главная",
+                                    };
+                                    if ui.selectable_label(self.page == page, label).clicked() {
+                                        self.focus_page(page);
+                                        ctx.request_repaint();
+                                    }
+                                }
+                            });
+                        });
+                });
+        }
         let transitions = self.config.appearance.transitions;
         for (id, page, rect) in &targets {
             let motion = self.panel_motion.entry(*id).or_insert_with(|| {
@@ -4767,6 +5005,7 @@ impl eframe::App for Launcher {
             && !self.ai_busy
             && self.page != Page::BuildEdit
             && self.secondary_page != Some(Page::BuildEdit)
+            && !self.extra_pages.contains(&Page::BuildEdit)
         {
             self.install_update_pending = false;
             if let Some(Ok(Some(update))) = &self.launcher_update {
@@ -4802,6 +5041,7 @@ fn smoke_test() -> anyhow::Result<()> {
     println!("Mojang: {} versions, all categories OK", all.len());
     let api = api::Api::new(std::env::var("CURSEFORGE_API_KEY").unwrap_or_default())?;
     let profile = Profile {
+        privacy: Default::default(),
         java: None,
         icon: Default::default(),
         name: "Test".into(),
@@ -5002,6 +5242,8 @@ mod ui_tests {
             app.sessions.push(GameSession {
                 id,
                 name: format!("Session {id}"),
+                version: "1.21.1".into(),
+                capture_logs: true,
                 instance: root.path().join(format!("{id}")),
                 cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 running: true,

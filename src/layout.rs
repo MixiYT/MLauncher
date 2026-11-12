@@ -15,17 +15,19 @@ pub enum PanelId {
     Versions,
     Mods,
     About,
+    Logs,
     Instance,
     Help,
 }
 impl PanelId {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Launcher,
         Self::Accounts,
         Self::Settings,
         Self::Versions,
         Self::Mods,
         Self::About,
+        Self::Logs,
         Self::Instance,
         Self::Help,
     ];
@@ -37,6 +39,7 @@ impl PanelId {
             Self::Versions => "versions",
             Self::Mods => "mods",
             Self::About => "about",
+            Self::Logs => "logs",
             Self::Instance => "instance",
             Self::Help => "help",
         }
@@ -65,6 +68,7 @@ pub struct PanelSizes {
     pub versions: [f32; 2],
     pub mods: [f32; 2],
     pub about: [f32; 2],
+    pub logs: [f32; 2],
     pub instance: [f32; 2],
     pub help: [f32; 2],
     pub viewport: [f32; 2],
@@ -82,6 +86,7 @@ impl Default for PanelSizes {
             versions: array(PanelId::Versions),
             mods: array(PanelId::Mods),
             about: array(PanelId::About),
+            logs: array(PanelId::Logs),
             instance: array(PanelId::Instance),
             help: array(PanelId::Help),
             viewport: [1104., 720.],
@@ -97,6 +102,7 @@ impl PanelSizes {
             PanelId::Versions => self.versions,
             PanelId::Mods => self.mods,
             PanelId::About => self.about,
+            PanelId::Logs => self.logs,
             PanelId::Instance => self.instance,
             PanelId::Help => self.help,
         };
@@ -121,6 +127,7 @@ impl PanelSizes {
             PanelId::Versions => self.versions = value,
             PanelId::Mods => self.mods = value,
             PanelId::About => self.about = value,
+            PanelId::Logs => self.logs = value,
             PanelId::Instance => self.instance = value,
             PanelId::Help => self.help = value,
         }
@@ -154,6 +161,23 @@ pub struct Geometry {
     pub detail: Option<Rect>,
 }
 impl Geometry {
+    pub fn tiled(screen: Rect, count: usize) -> Vec<Rect> {
+        let area = screen.shrink(GAP);
+        let columns = (((area.width() + GAP) / (360. + GAP)).floor().max(1.) as usize).min(count);
+        let rows = (((area.height() + GAP) / (384. + GAP)).floor().max(1.) as usize)
+            .min(count.div_ceil(columns));
+        let size = Vec2::new(
+            (area.width() - GAP * (columns - 1) as f32) / columns as f32,
+            (area.height() - GAP * (rows - 1) as f32) / rows as f32,
+        );
+        (0..count.min(columns * rows))
+            .map(|i| {
+                let offset = Vec2::new((i % columns) as f32, (i / columns) as f32);
+                Rect::from_min_size(area.min + offset * (size + Vec2::splat(GAP)), size)
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     pub fn new(screen: Rect, sizes: &PanelSizes, detail: Option<PanelId>) -> Self {
         Self::new_two(screen, sizes, None, detail)

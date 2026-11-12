@@ -1569,6 +1569,7 @@ fn finish(m: Manifest, staged: &Path, instances: &Path, cancel: &AtomicBool) -> 
     anyhow::ensure!(!target.exists(), "Папка сборки уже существует");
     fs::rename(staged, &target)?;
     Ok(Profile {
+        privacy: Default::default(),
         java: None,
         icon: Default::default(),
         name: m.name,
@@ -2125,6 +2126,7 @@ mod tests {
         )
         .unwrap();
         let p = Profile {
+            privacy: Default::default(),
             java: None,
             icon: Default::default(),
             name: "Test".into(),
@@ -2208,6 +2210,7 @@ mod tests {
         fs::write(instance.join("config/a.toml"), b"test=true").unwrap();
         fs::write(instance.join("sessions.dat"), b"secret").unwrap();
         let p = Profile {
+            privacy: Default::default(),
             java: None,
             icon: Default::default(),
             name: "Test".into(),

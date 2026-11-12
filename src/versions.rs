@@ -17,6 +17,60 @@ pub enum VersionKind {
     Alpha,
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Sort {
+    #[default]
+    Date,
+    Usage,
+    Alphabetical,
+}
+
+impl Sort {
+    pub const ALL: [Self; 3] = [Self::Date, Self::Usage, Self::Alphabetical];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Date => "По дате",
+            Self::Usage => "По частоте запусков",
+            Self::Alphabetical => "По алфавиту",
+        }
+    }
+}
+
+pub fn mod_catalog_version<'a>(versions: &'a [MinecraftVersion], id: &'a str) -> &'a str {
+    let Some(snapshot) = versions
+        .iter()
+        .find(|version| version.id == id && version.kind == VersionKind::Snapshot)
+    else {
+        return id;
+    };
+    let Some(published) = release_seconds(&snapshot.release_time) else {
+        return id;
+    };
+    versions
+        .iter()
+        .filter(|version| version.kind == VersionKind::Release)
+        .filter_map(|version| Some((version, release_seconds(&version.release_time)?)))
+        .min_by_key(|(_, release)| (release.abs_diff(published), *release > published))
+        .map_or(id, |(version, _)| version.id.as_str())
+}
+
+// Mojang publishes UTC timestamps as YYYY-MM-DDTHH:MM:SS followed by a UTC suffix.
+fn release_seconds(timestamp: &str) -> Option<i64> {
+    let number = |start, end| timestamp.get(start..end)?.parse::<i64>().ok();
+    let year = number(0, 4)?;
+    let month = usize::try_from(number(5, 7)?).ok()?.checked_sub(1)?;
+    let prior_year = year - 1;
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_days = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    let days = prior_year * 365 + prior_year / 4 - prior_year / 100
+        + prior_year / 400
+        + month_days.get(month)?
+        + i64::from(leap && month >= 2)
+        + number(8, 10)?;
+    Some(days * 86_400 + number(11, 13)? * 3600 + number(14, 16)? * 60 + number(17, 19)?)
+}
+
 impl VersionKind {
     pub const ALL: [Self; 4] = [Self::Release, Self::Snapshot, Self::Beta, Self::Alpha];
     pub fn label(self) -> &'static str {

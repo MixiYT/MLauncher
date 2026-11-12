@@ -20,17 +20,21 @@ pub struct Options {
     pub accent: [u8; 3],
     pub light: bool,
     pub effect: String,
+    pub theme: crate::appearance::Theme,
+    pub interface_style: crate::appearance::InterfaceStyle,
 }
 impl Options {
-    pub fn installed(key: String, accent: [u8; 3], light: bool, effect: impl Into<String>) -> Self {
+    pub fn installed(key: String, appearance: &crate::appearance::Appearance) -> Self {
         Self {
             dll: std::env::current_exe()
                 .unwrap_or_default()
                 .with_file_name("mlauncher-overlay.dll"),
             key,
-            accent,
-            light,
-            effect: effect.into(),
+            accent: appearance.accent,
+            light: appearance.theme == crate::appearance::Theme::Light,
+            effect: format!("{:?}", appearance.effect),
+            theme: appearance.theme,
+            interface_style: appearance.interface_style,
         }
     }
 }
