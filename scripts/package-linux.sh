@@ -2,7 +2,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+version=$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)
 test -n "$version"
 test "$(uname -s)-$(uname -m)" = Linux-x86_64
 

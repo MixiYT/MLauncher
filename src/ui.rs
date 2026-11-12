@@ -195,7 +195,7 @@ pub fn account_icons(ui: &mut egui::Ui, kind: crate::auth::AccountKind, ely_skin
 }
 
 pub fn loader_icon(ui: &mut egui::Ui, loader: &str, official: bool) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(26., 18.), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(48., 28.), Sense::hover());
     if let Some(texture) = crate::icons::loader_texture(ui, loader, official) {
         let image = egui::Image::new(&texture)
             .max_size(rect.size())
@@ -211,7 +211,7 @@ pub fn loader_icon(ui: &mut egui::Ui, loader: &str, official: bool) {
         paint_icon(
             ui,
             Icon::Builds,
-            Rect::from_center_size(rect.center(), Vec2::splat(16.)),
+            Rect::from_center_size(rect.center(), Vec2::splat(24.)),
             ui.visuals().text_color(),
         );
     }

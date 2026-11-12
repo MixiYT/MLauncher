@@ -340,10 +340,14 @@ static void drawOverlay() {
         std::lock_guard<std::mutex> lock(dataMutex);snapshot=data;lastRevision=revision.load();
     }
     const ImVec2 screen=ImGui::GetIO().DisplaySize;
+    static ImVec2 previousScreen(0.f, 0.f);
+    const bool resized=screen.x!=previousScreen.x||screen.y!=previousScreen.y;
+    previousScreen=screen;
+    const ImGuiCond placement=resized?ImGuiCond_Always:ImGuiCond_FirstUseEver;
     drawEffectBackground(screen);
     ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0,0),screen,lightStyle?IM_COL32(220,226,232,70):IM_COL32(0,0,0,140));
-    ImGui::SetNextWindowSize(ImVec2(std::min(920.f,screen.x*.90f),std::min(680.f,screen.y*.9f)),ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowPos(ImVec2(screen.x*.5f,screen.y*.5f),ImGuiCond_FirstUseEver,ImVec2(.5f,.5f));
+    ImGui::SetNextWindowSize(ImVec2(std::min(920.f,screen.x*.90f),std::min(680.f,screen.y*.9f)),placement);
+    ImGui::SetNextWindowPos(ImVec2(screen.x*.5f,screen.y*.5f),placement,ImVec2(.5f,.5f));
     bool open=true;
     if(ImGui::Begin("MLauncher · Shift+Tab / Esc",&open,ImGuiWindowFlags_NoCollapse)){
         ImGui::TextUnformatted(snapshot.value("name",std::string("Minecraft")).c_str());
