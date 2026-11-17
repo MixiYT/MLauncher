@@ -49,9 +49,19 @@ struct State {
     stop: AtomicBool,
     workers: AtomicUsize,
     download: AtomicBool,
-    projects: Mutex<Vec<crate::packs::Entry>>,
-    maps: Mutex<Vec<crate::packs::Entry>>,
+    projects: Mutex<Catalog>,
+    maps: Mutex<Catalog>,
     native_status: Mutex<Option<String>>,
+}
+#[derive(Default)]
+struct Catalog {
+    entries: Vec<crate::packs::Entry>,
+    query: String,
+    resolved_query: String,
+    provider: crate::packs::Provider,
+    sort: crate::model::SortOrder,
+    offset: usize,
+    more: bool,
 }
 pub struct Bridge {
     state: Arc<State>,
@@ -75,8 +85,8 @@ impl Bridge {
             stop: AtomicBool::new(false),
             workers: AtomicUsize::new(0),
             download: AtomicBool::new(false),
-            projects: Mutex::new(vec![]),
-            maps: Mutex::new(vec![]),
+            projects: Mutex::new(Catalog::default()),
+            maps: Mutex::new(Catalog::default()),
             native_status: Mutex::new(None),
         });
         let shared = state.clone();
@@ -283,18 +293,49 @@ fn serve(mut stream: TcpStream, state: &State) -> Result<()> {
                     "newest" => crate::model::SortOrder::Newest,
                     _ => crate::model::SortOrder::Downloads,
                 };
-                let (_, entries) = crate::browse::search_variants(query, None, |query| {
-                    if maps {
-                        service.search_maps(query, &state.mc, sort, 0)
-                    } else {
-                        service.search_sorted(provider, query, true, &state.mc, sort)
-                    }
-                })?;
-                let entries: Vec<_> = entries.into_iter().take(20).collect();
+                let append = body["append"].as_bool().unwrap_or(false);
                 let catalog = if maps { &state.maps } else { &state.projects };
-                *catalog
+                let mut catalog = catalog
                     .lock()
-                    .map_err(|_| anyhow::anyhow!("Каталог недоступен"))? = entries.clone();
+                    .map_err(|_| anyhow::anyhow!("Каталог недоступен"))?;
+                let (offset, resolved) = if append {
+                    anyhow::ensure!(
+                        catalog.query == query
+                            && catalog.provider == provider
+                            && catalog.sort == sort
+                            && catalog.more
+                            && body["offset"].as_u64() == Some(catalog.offset as u64),
+                        "Обновите поиск"
+                    );
+                    (catalog.offset, Some(catalog.resolved_query.clone()))
+                } else {
+                    (0, None)
+                };
+                let (resolved_query, mut entries) =
+                    crate::browse::search_variants(query, resolved, |query| {
+                        if maps {
+                            service.search_maps(query, &state.mc, sort, offset)
+                        } else {
+                            service.search_page(provider, query, true, &state.mc, sort, offset)
+                        }
+                    })?;
+                let count = entries.len();
+                if !append {
+                    catalog.entries.clear();
+                }
+                let mut seen: std::collections::HashSet<_> =
+                    catalog.entries.iter().map(|e| e.id.clone()).collect();
+                entries.retain(|entry| seen.insert(entry.id.clone()));
+                catalog.entries.extend(entries.iter().cloned());
+                catalog.query = query.to_owned();
+                catalog.resolved_query = resolved_query;
+                catalog.provider = provider;
+                catalog.sort = sort;
+                catalog.offset = offset + count;
+                catalog.more = count == 20 && !entries.is_empty();
+                let more = catalog.more;
+                let offset = catalog.offset;
+                drop(catalog);
                 let installed = crate::packs::resources(&state.instance);
                 let thumbnails = catalog_thumbnails(&entries);
                 let entries: Vec<_> = entries
@@ -317,7 +358,9 @@ fn serve(mut stream: TcpStream, state: &State) -> Result<()> {
                         })
                     })
                     .collect();
-                Ok(json!({"entries":entries,"minecraft":state.mc,"name":state.name}))
+                Ok(
+                    json!({"entries":entries,"more":more,"offset":offset,"minecraft":state.mc,"name":state.name}),
+                )
             }
             "/download" | "/download-map" => {
                 anyhow::ensure!(
@@ -344,6 +387,7 @@ fn serve(mut stream: TcpStream, state: &State) -> Result<()> {
                 let entry = catalog
                     .lock()
                     .map_err(|_| anyhow::anyhow!("Каталог недоступен"))?
+                    .entries
                     .iter()
                     .find(|e| e.provider == provider && e.id == id)
                     .cloned()
@@ -639,6 +683,7 @@ pub fn smoke_test() -> Result<()> {
             .projects
             .lock()
             .unwrap()
+            .entries
             .first()
             .cloned()
             .context("Нативный поиск не вернул карточки")?;
@@ -665,6 +710,33 @@ pub fn smoke_test() -> Result<()> {
         println!(
             "Native WinHTTP catalog search + authenticated resource download + duplicate check OK"
         );
+        let search = |body: Value| -> Result<Value> {
+            Ok(client
+                .post(format!("http://127.0.0.1:{}/resources", bridge.port))
+                .header("X-MLauncher-Token", bridge.secret())
+                .json(&body)
+                .send()?
+                .error_for_status()?
+                .json()?)
+        };
+        let first = search(json!({}))?;
+        anyhow::ensure!(
+            first["more"] == true,
+            "Первая страница каталога заполнена не полностью"
+        );
+        let second = search(json!({"append":true,"offset":first["offset"]}))?;
+        let first = first["entries"].as_array().context("Нет первой страницы")?;
+        let second = second["entries"]
+            .as_array()
+            .context("Нет второй страницы")?;
+        anyhow::ensure!(
+            !second.is_empty()
+                && second
+                    .iter()
+                    .all(|entry| first.iter().all(|prior| prior["id"] != entry["id"])),
+            "Вторая страница пуста или повторяет первую"
+        );
+        println!("Overlay catalog pagination and deduplication OK");
     }
     println!("Authenticated loopback bridge + native DLL injection + Shift+Tab OK");
     println!("Screenshot: {}", output.display());

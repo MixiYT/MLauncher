@@ -15,15 +15,17 @@ pub enum Tab {
     Mods,
     Resources,
     Worlds,
+    Loot,
     Screenshots,
 }
 impl Tab {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::General,
         Self::Java,
         Self::Mods,
         Self::Resources,
         Self::Worlds,
+        Self::Loot,
         Self::Screenshots,
     ];
     fn label(self) -> &'static str {
@@ -33,6 +35,7 @@ impl Tab {
             Self::Mods => "Моды",
             Self::Resources => "Ресурспаки",
             Self::Worlds => "Миры",
+            Self::Loot => "Таблицы лута",
             Self::Screenshots => "Скриншоты",
         }
     }
@@ -41,6 +44,7 @@ impl Tab {
             Self::Mods => "mods",
             Self::Resources => "resourcepacks",
             Self::Worlds => "saves",
+            Self::Loot => "loot_tables",
             Self::Screenshots => "screenshots",
             _ => "",
         }
@@ -51,7 +55,73 @@ pub enum Action {
     Close,
     Catalog(bool),
     IdentifyMods,
+    CheckCompatibility,
     Changed,
+}
+
+struct LootTable {
+    path: PathBuf,
+    saved: String,
+    draft: String,
+}
+
+impl LootTable {
+    fn read(instance: &Path, path: &Path) -> Result<(PathBuf, String)> {
+        use std::io::Read;
+        let path = path.canonicalize()?;
+        let relative = path.strip_prefix(instance.canonicalize()?)?;
+        let parts: Vec<_> = relative.iter().filter_map(|c| c.to_str()).collect();
+        anyhow::ensure!(
+            path.extension().is_some_and(|ext| ext == "json")
+                && parts.windows(4).any(|p| p[0] == "data" && matches!(p[2], "loot_table" | "loot_tables")),
+            "Выберите JSON в папке data/<пространство имён>/loot_table или loot_tables"
+        );
+        let mut text = String::new();
+        std::fs::File::open(&path)?.take(1024 * 1024 + 1).read_to_string(&mut text)?;
+        anyhow::ensure!(text.len() <= 1024 * 1024, "Таблица больше 1 МиБ");
+        Ok((path, text))
+    }
+
+    fn open(instance: &Path, path: &Path) -> Result<Self> {
+        let (path, saved) = Self::read(instance, path)?;
+        Ok(Self { path, draft: saved.clone(), saved })
+    }
+
+    fn save(&mut self, instance: &Path) -> Result<()> {
+        anyhow::ensure!(self.draft.len() <= 1024 * 1024, "Таблица больше 1 МиБ");
+        let value: serde_json::Value = serde_json::from_str(&self.draft)
+            .context("Проверьте синтаксис JSON")?;
+        anyhow::ensure!(
+            value.as_object().is_some() && value.get("pools").is_none_or(|p| p.is_array()),
+            "Таблица должна быть объектом JSON, поле pools — массивом"
+        );
+        let (path, current) = Self::read(instance, &self.path)?;
+        anyhow::ensure!(path == self.path && current == self.saved, "Файл изменился. Откройте его повторно.");
+        crate::downloads::atomic_write(&path, self.draft.as_bytes())?;
+        self.saved.clone_from(&self.draft);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod loot_tests {
+    use super::*;
+
+    #[test]
+    fn loot_editor_preserves_files_on_invalid_json_and_external_edits() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("datapacks/pack/data/example/loot_table/drop.json");
+        crate::downloads::atomic_write(&path, b"{}").unwrap();
+        let mut table = LootTable::open(root.path(), &path).unwrap();
+        table.draft = r#"{"pools":1}"#.into();
+        assert!(table.save(root.path()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{}");
+        table.draft = r#"{"pools":[]}"#.into();
+        table.save(root.path()).unwrap();
+        crate::downloads::atomic_write(&path, b"null").unwrap();
+        assert!(table.save(root.path()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"null");
+    }
 }
 pub struct Editor {
     pub directory: String,
@@ -68,6 +138,8 @@ pub struct Editor {
     installed: Vec<model::InstalledMod>,
     custom_icon: Option<(Vec<u8>, egui::TextureHandle)>,
     preview: Option<(PathBuf, egui::TextureHandle)>,
+    loot: Option<LootTable>,
+    compatibility: Option<String>,
     status: String,
     error: bool,
 }
@@ -88,6 +160,8 @@ impl Editor {
             installed: Vec::new(),
             custom_icon: None,
             preview: None,
+            loot: None,
+            compatibility: None,
             status: String::new(),
             error: false,
         }
@@ -154,6 +228,14 @@ impl Editor {
 
     pub fn refresh_content(&mut self) {
         self.refresh = true;
+        self.compatibility = None;
+    }
+    pub fn compatibility_result(&mut self, result: Result<Vec<String>>) {
+        self.compatibility = Some(match result {
+            Ok(issues) if issues.is_empty() => "В метаданных активных модов явных конфликтов не найдено.".into(),
+            Ok(issues) => issues.join("\n"),
+            Err(error) => format!("Проверка не завершена: {error:#}"),
+        });
     }
     pub fn ui(
         &mut self,
@@ -213,6 +295,7 @@ impl Editor {
                 ui.add_enabled_ui(!blocked, |ui| {
                     ui.checkbox(&mut self.draft.privacy.hide_mods, "Скрывать моды в интерфейсе");
                     ui.checkbox(&mut self.draft.privacy.disable_logs, "Не собирать журнал в MLauncher");
+                    ui.checkbox(&mut self.draft.privacy.show_in_discord, "Показывать название и версию в Discord");
                     ui.label("Иконка сборки");
                     ui.horizontal_wrapped(|ui| {
                         for (preset, label) in BuildIcon::PRESETS {
@@ -243,6 +326,13 @@ impl Editor {
                     ui.add(egui::TextEdit::singleline(&mut self.draft.name).desired_width(f32::INFINITY));
                 });
                 ui.label(format!("Minecraft {} · {}", self.draft.game_version, self.draft.loader));
+                if ui.add_enabled(!blocked, egui::Button::new("Проверить совместимость модов")).clicked() {
+                    self.compatibility = Some("Проверка метаданных модов…".into());
+                    action = Some(Action::CheckCompatibility);
+                }
+                if let Some(report) = &self.compatibility {
+                    ui.add(egui::Label::new(report).wrap());
+                }
                 ui.add(egui::Label::new(instance.display().to_string()).wrap());
                 if ui.button("Открыть папку сборки").clicked() { self.report(open::that(instance).map_err(Into::into)); }
                 ui.label("Настройки Java относятся только к этой сборке. Моды, ресурспаки, миры и скриншоты находятся в соседних разделах.");
@@ -271,6 +361,29 @@ impl Editor {
                         ui.label("JVM-аргументы, один на строку");
                         ui.add(egui::TextEdit::multiline(&mut self.java.extra_args).desired_width(f32::INFINITY).desired_rows(4));
                     });
+                });
+            } else if self.tab == Tab::Loot {
+                ui.add_enabled_ui(!blocked, |ui| {
+                    if ui.button("Открыть JSON таблицы лута…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().set_directory(instance)
+                            .add_filter("Таблица лута Minecraft", &["json"]).pick_file() {
+                            match LootTable::open(instance, &path) {
+                                Ok(loot) => self.loot = Some(loot),
+                                Err(error) => self.report(Err(error)),
+                            }
+                        }
+                    }
+                    if let Some(loot) = &mut self.loot {
+                        ui.label(loot.path.file_name().unwrap_or_default().to_string_lossy());
+                        ui.add(egui::TextEdit::multiline(&mut loot.draft)
+                            .code_editor().desired_rows(18).desired_width(f32::INFINITY));
+                        if ui.button("Сохранить таблицу").clicked() {
+                            let result = loot.save(instance);
+                            self.report(result);
+                        }
+                    } else {
+                        ui.label("Откройте таблицу из распакованного датапака или папки kubejs выбранной сборки.");
+                    }
                 });
             } else if self.tab == Tab::Mods && self.draft.privacy.hide_mods {
                 ui.label("Список модов скрыт настройками сборки.");
@@ -402,6 +515,83 @@ impl Editor {
         });
         action
     }
+}
+
+pub fn check_compatibility(profile: &Profile, instance: &Path) -> Result<Vec<String>> {
+    use std::{collections::{HashMap, HashSet}, fs, io::Read};
+    let folder = instance.join("mods");
+    if !folder.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut issues = Vec::new();
+    let mut ids = HashMap::new();
+    let mut provided = HashSet::new();
+    let mut exact_dependencies = Vec::new();
+    for entry in fs::read_dir(folder)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry.file_type()?.is_file()
+            || !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("jar"))
+        {
+            continue;
+        }
+        let filename = entry.file_name().to_string_lossy().into_owned();
+        let Ok(mut archive) = zip::ZipArchive::new(fs::File::open(&path)?) else {
+            issues.push(format!("{filename}: повреждённый JAR"));
+            continue;
+        };
+        let loaders = [
+            ("fabric", "fabric.mod.json"),
+            ("quilt", "quilt.mod.json"),
+            ("forge", "META-INF/mods.toml"),
+            ("neoforge", "META-INF/neoforge.mods.toml"),
+        ];
+        let supported: Vec<_> = loaders.into_iter()
+            .filter_map(|(loader, descriptor)| archive.index_for_name(descriptor).map(|_| loader))
+            .collect();
+        let compatible = supported.contains(&profile.loader.as_str())
+            || profile.loader == "quilt" && supported.contains(&"fabric")
+            || profile.loader == "neoforge" && supported.contains(&"forge") && profile.game_version == "1.20.1";
+        if !supported.is_empty() && !compatible {
+            issues.push(format!("{filename}: загрузчики в JAR — {}, выбран {}", supported.join(", "), profile.loader));
+        }
+        if let Ok(fabric) = archive.by_name("fabric.mod.json") {
+            let mut bytes = Vec::new();
+            fabric.take(128 * 1024 + 1).read_to_end(&mut bytes)?;
+            let Ok(data) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                issues.push(format!("{filename}: нечитаемый fabric.mod.json"));
+                continue;
+            };
+            if let Some(id) = data["id"].as_str() {
+                if let Some(previous) = ids.insert(id.to_owned(), filename.clone()) {
+                    issues.push(format!("Повтор ID {id}: {previous}, {filename}"));
+                }
+            }
+            if let Some(aliases) = data["provides"].as_array() {
+                provided.extend(aliases.iter().filter_map(|id| id.as_str().map(str::to_owned)));
+            }
+            if let Some(deps) = data["depends"].as_object() {
+                for (id, range) in deps {
+                    if let Some(range) = range.as_str() {
+                        let version = range.strip_prefix('=').unwrap_or(range);
+                        if !version.is_empty() && version.bytes().all(|c| c.is_ascii_digit() || c == b'.') {
+                            exact_dependencies.push((filename.clone(), id.clone(), version.to_owned()));
+                        }
+                    }
+                }
+            }
+        };
+    }
+    for (file, id, version) in exact_dependencies {
+        if id == "minecraft" && profile.game_version != version {
+            issues.push(format!("{file}: требуется Minecraft {version}"));
+        } else if !matches!(id.as_str(), "minecraft" | "java" | "fabricloader" | "quilt_loader")
+            && !ids.contains_key(&id) && !provided.contains(&id) {
+            issues.push(format!("{file}: зависимость {id} {version} не найдена среди отдельных JAR"));
+        }
+    }
+    issues.sort();
+    Ok(issues)
 }
 fn thumbnail(path: &Path, tab: Tab) -> Result<egui::ColorImage> {
     use std::io::Read;

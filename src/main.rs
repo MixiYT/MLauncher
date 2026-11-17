@@ -8,6 +8,7 @@ mod auth;
 mod avatars;
 mod browse;
 mod content;
+mod discord;
 mod downloads;
 mod effects;
 mod game;
@@ -95,6 +96,8 @@ impl VersionTab {
 enum Event {
     BuildsFound(Vec<migration::Build>),
     BuildImported(anyhow::Result<Profile>),
+    BuildsMerged(anyhow::Result<Profile>),
+    CompatibilityChecked(String, anyhow::Result<Vec<String>>),
     LauncherUpdate(anyhow::Result<Option<updater::Ready>>),
     Search(u64, usize, anyhow::Result<(String, Vec<Project>)>),
     Progress(String),
@@ -195,6 +198,7 @@ struct Launcher {
     updates: std::collections::HashMap<String, Option<String>>,
     version_tab: VersionTab,
     editing_build: Option<usize>,
+    merge_build: Option<String>,
     edit_build_name: String,
     delete_build: Option<usize>,
     delete_build_folder: bool,
@@ -206,6 +210,7 @@ struct Launcher {
     ai_defaults_checked: Option<std::time::Instant>,
     ai_defaults_busy: bool,
     ai_key: zeroize::Zeroizing<String>,
+    discord: discord::Presence,
     ai_question: String,
     ai_report: String,
     ai_answer: String,
@@ -305,6 +310,7 @@ struct GameSession {
     name: String,
     version: String,
     capture_logs: bool,
+    show_in_discord: bool,
     instance: PathBuf,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     running: bool,
@@ -431,6 +437,7 @@ impl Launcher {
             updates: Default::default(),
             version_tab: VersionTab::Catalog,
             editing_build: None,
+            merge_build: None,
             edit_build_name: String::new(),
             delete_build: None,
             delete_build_folder: false,
@@ -443,6 +450,7 @@ impl Launcher {
             ai_defaults_checked: None,
             ai_defaults_busy: false,
             ai_key: zeroize::Zeroizing::new(ai_key),
+            discord: discord::Presence::default(),
             ai_question: String::new(),
             ai_report: String::new(),
             ai_answer: String::new(),
@@ -788,6 +796,7 @@ impl Launcher {
             name: request.profile.name.clone(),
             version: request.profile.game_version.clone(),
             capture_logs: !request.profile.privacy.disable_logs,
+            show_in_discord: request.profile.privacy.show_in_discord,
             instance: request.instance.clone(),
             cancel: cancel.clone(),
             running: false,
@@ -1186,7 +1195,13 @@ impl Launcher {
                     self.scanning_builds = false;
                     self.discovered_builds = builds;
                 }
-                Event::BuildImported(result) => {
+                Event::CompatibilityChecked(directory, result) => {
+                    self.busy = false;
+                    if let Some(editor) = self.build_editor.as_mut().filter(|e| e.directory == directory) {
+                        editor.compatibility_result(result);
+                    }
+                }
+                Event::BuildImported(result) | Event::BuildsMerged(result) => {
                     self.busy = false;
                     self.mod_cancel = None;
                     match result {
@@ -1195,7 +1210,7 @@ impl Launcher {
                             self.config.selected = self.config.profiles.len() - 1;
                             self.changed_instance();
                             if !self.error {
-                                self.result(Ok(()), "Сборка перенесена в MLauncher");
+                                self.result(Ok(()), "Новая сборка добавлена");
                             }
                         }
                         Err(error) => self.result(Err(error), ""),
@@ -1741,7 +1756,7 @@ impl Launcher {
                 let width = ui.available_width();
                 ui::icon_button_size(ui, icon, label, Vec2::new(width, layout::ROW)).clicked()
             };
-            if click(&mut columns[0], Icon::MyBuilds, "Мои сборки") {
+            if click(&mut columns[0], Icon::MyBuilds, "Редактор сборок") {
                 self.toggle_library(VersionTab::Builds);
             }
             if click(&mut columns[1], Icon::Folder, "Папка игры") {
@@ -2072,11 +2087,11 @@ impl Launcher {
                 egui::ComboBox::from_label(label)
                     .selected_text(match group {
                         LibraryGroup::Catalog => "Каталог версий",
-                        LibraryGroup::MyBuilds => "Мои сборки",
+                        LibraryGroup::MyBuilds => "Редактор сборок",
                     })
                     .show_animated(ui, |ui| {
                         ui.selectable_value(group, LibraryGroup::Catalog, "Каталог версий");
-                        ui.selectable_value(group, LibraryGroup::MyBuilds, "Мои сборки");
+                        ui.selectable_value(group, LibraryGroup::MyBuilds, "Редактор сборок");
                     });
             }
             if previous != *tabs {
@@ -2262,6 +2277,16 @@ impl Launcher {
         }
         ui.separator();
         self.ai_settings(ui);
+        ui.separator();
+        ui.strong("Активность Discord");
+        ui.add(egui::TextEdit::singleline(&mut self.config.discord_application)
+            .hint_text("Application ID"));
+        if !self.config.discord_application.is_empty()
+            && self.config.discord_application.trim().parse::<u64>().is_err() {
+            ui.label("Application ID должен состоять из цифр.");
+        }
+        ui.small("Пустое поле выключает активность. Название сборки включается в её редакторе.");
+        ui.hyperlink_to("Приложения Discord", "https://discord.com/developers/applications");
         if ui.button("Сохранить").clicked() {
             self.save();
         }
@@ -2729,8 +2754,8 @@ impl Launcher {
 
     fn edit_instance(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let Some(mut editor) = self.build_editor.take() else {
-            ui.label("Выберите сборку в разделе «Мои сборки».");
-            if ui.button("Мои сборки").clicked() {
+            ui.label("Выберите сборку в разделе «Редактор сборок».");
+            if ui.button("Редактор сборок").clicked() {
                 self.version_tab = VersionTab::Builds;
                 self.navigate(Page::Versions);
             }
@@ -2784,6 +2809,16 @@ impl Launcher {
                     let result =
                         api::Api::new(String::new()).and_then(|api| api.identify_local_mods(&path));
                     let _ = tx.send(Event::ModsIdentified(result));
+                    ctx.request_repaint();
+                });
+            }
+            Some(instance::Action::CheckCompatibility) => {
+                self.busy = true;
+                let profile = editor.draft.clone();
+                let (tx, ctx) = (self.tx.clone(), ctx.clone());
+                std::thread::spawn(move || {
+                    let result = instance::check_compatibility(&profile, &path);
+                    let _ = tx.send(Event::CompatibilityChecked(profile.directory, result));
                     ctx.request_repaint();
                 });
             }
@@ -2896,6 +2931,39 @@ impl Launcher {
             ui.label(RichText::new(format!("Всего: {}", self.config.profiles.len())).small());
         });
         ui.separator();
+        egui::CollapsingHeader::new("Создание и исправление с ИИ").show(ui, |ui| {
+            self.ai_ui(ui, ctx, true);
+        });
+        egui::CollapsingHeader::new("Объединить сборки").show(ui, |ui| {
+            let Some(base) = self.config.profiles.get(self.config.selected) else { return };
+            let candidates = self.config.profiles.iter().filter(|p| {
+                p.directory != base.directory && p.game_version == base.game_version && p.loader == base.loader
+            });
+            let other = candidates.clone().find(|p| self.merge_build.as_deref() == Some(&p.directory));
+            ui.label(format!("Основная сборка: {}", base.name));
+            egui::ComboBox::from_id_salt("merge_build").selected_text(other.map_or("Выберите вторую сборку", |p| &p.name))
+                .show_ui(ui, |ui| {
+                    for profile in candidates {
+                        ui.selectable_value(&mut self.merge_build, Some(profile.directory.clone()), &profile.name);
+                    }
+                });
+            ui.small("Моды, конфиги, скрипты и паки копируются в новую сборку. Разные файлы с одинаковым именем вызовут конфликт.");
+            if let Some(other) = other {
+                let enabled = !self.busy && !self.content_mutation_busy() && self.sessions.is_empty();
+                if ui.add_enabled(enabled, egui::Button::new("Создать объединённую сборку")).clicked() {
+                    let (base, other) = (base.clone(), other.clone());
+                    let instances = self.config.game_root(&self.root).join("instances");
+                    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    self.mod_cancel = Some(cancel.clone());
+                    self.busy = true;
+                    let (tx, ctx) = (self.tx.clone(), ctx.clone());
+                    std::thread::spawn(move || {
+                        let _ = tx.send(Event::BuildsMerged(packs::merge_builds(&base, &other, &instances, &cancel)));
+                        ctx.request_repaint();
+                    });
+                }
+            }
+        });
         self.discovered_builds(ui, ctx);
         let selected = self.config.selected;
         let count = self.config.profiles.len();
@@ -3064,7 +3132,7 @@ impl Launcher {
                     (
                         VersionTab::Builds,
                         Icon::MyBuilds,
-                        "Мои сборки",
+                        "Редактор сборок",
                         "Управление установленными сборками",
                     ),
                     (
@@ -3919,7 +3987,7 @@ impl Launcher {
             Page::Settings => "Настройки",
             Page::Versions => match self.version_tab.group(self.config.library_tabs) {
                 model::LibraryGroup::Catalog => "Каталог версий",
-                model::LibraryGroup::MyBuilds => "Мои сборки",
+                model::LibraryGroup::MyBuilds => "Редактор сборок",
             },
             Page::Mods => "Моды и ресурспаки",
             Page::About => "О проекте",
@@ -3946,7 +4014,7 @@ impl Launcher {
         });
         ui.separator();
         if self.page == Page::Help {
-            self.ai_ui(ui, ctx);
+            self.ai_ui(ui, ctx, false);
         } else if self.page == Page::BuildEdit {
             self.edit_instance(ui, ctx);
         } else if self.page == Page::Settings {
@@ -4058,12 +4126,35 @@ impl Launcher {
                 self.check_ai_defaults(ui.ctx());
             }
         } else {
+            ui.horizontal_wrapped(|ui| {
+                for (label, endpoint, model) in [
+                    ("Ollama · локально", "http://127.0.0.1:11434/v1/chat/completions", "qwen3:4b"),
+                    ("OpenRouter · бесплатно", "https://openrouter.ai/api/v1/chat/completions", "openrouter/free"),
+                ] {
+                    if ui.button(label).clicked() {
+                        if self.config.assistant.endpoint != endpoint {
+                            zeroize::Zeroize::zeroize(&mut *self.ai_key);
+                        }
+                        self.config.assistant.endpoint = endpoint.into();
+                        self.config.assistant.model = model.into();
+                    }
+                }
+            });
             ui.label("URL запроса (полный, с /chat/completions)");
             ui.text_edit_singleline(&mut self.config.assistant.endpoint);
             ui.label("Модель");
             ui.text_edit_singleline(&mut self.config.assistant.model);
-            ui.label("Личный API-ключ (DPAPI)");
+            ui.label("API-ключ провайдера");
             ui.add(egui::TextEdit::singleline(&mut *self.ai_key).password(true));
+            match self.config.assistant.endpoint.as_str() {
+                "http://127.0.0.1:11434/v1/chat/completions" => {
+                    ui.small("Запустите Ollama и укажите имя установленной модели. Ключ можно оставить пустым.");
+                }
+                "https://openrouter.ai/api/v1/chat/completions" => {
+                    ui.small("Нужен собственный API-ключ OpenRouter. Бесплатные модели доступны с лимитами.");
+                }
+                _ => {}
+            }
         }
         ui.small("Запросы и журналы отправляются только после действия в помощнике. Получатель показан перед отправкой.");
         if ui.button("Открыть помощника").clicked() {
@@ -4366,123 +4457,127 @@ impl Launcher {
         self.request_ai_plan(ctx);
     }
 
-    fn ai_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn ai_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, build_tools: bool) {
         egui::ScrollArea::vertical()
-            .id_salt("ai_helper")
+            .id_salt(("ai_helper", build_tools))
+            .max_height(if build_tools { 260. } else { f32::INFINITY })
             .show(ui, |ui| {
-                ui.label("Опишите сборку, которую нужно создать, или задачу для текущей сборки.");
-                ui.small("Например: «Создай Fabric 1.21.1 с Sodium, Iris и Jade и запусти».");
+                if build_tools {
+                    ui.label("Опишите сборку, которую нужно создать, или задачу для текущей сборки.");
+                    ui.small("Например: «Создай Fabric 1.21.1 с Sodium, Iris и Jade и запусти».");
 
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.ai_question)
-                        .desired_rows(2)
-                        .desired_width(f32::INFINITY),
-                );
-                ui.small(format!("Запрос, параметры сборки и журналы будут переданы в {}. При включённом автоисправлении после сбоя они отправляются повторно.", self.effective_ai().0.endpoint));
-                let old_settings = serde_json::to_string(&self.config.assistant).unwrap_or_default();
-                ui.checkbox(&mut self.config.assistant.auto_repair, "Автоматически исправлять сбои ИИ-запуска");
-                ui.add(egui::Slider::new(&mut self.config.assistant.max_repairs, 1..=3).text("Попыток исправления"));
-                if old_settings != serde_json::to_string(&self.config.assistant).unwrap_or_default() {
-                    let result = self.config.save(&self.root);
-                    self.result(result, "");
-                }
-                ui.horizontal_wrapped(|ui| {
-                    let enabled = !self.ai_busy && self.ai_task.is_none() && !self.busy
-                        && self.sessions.is_empty() && !self.content_mutation_busy() && !self.ai_question.trim().is_empty();
-                    if ui.add_enabled(enabled, egui::Button::new("Выполнить запрос")).clicked() {
-                        self.begin_ai_task(ctx, false);
-                    }
-                    if ui.add_enabled(enabled, egui::Button::new("Исправить текущую сборку")).clicked() {
-                        self.begin_ai_task(ctx, true);
-                    }
-                    if let Some(task) = &self.ai_task {
-                        if ui.button("Остановить автоматизацию").clicked() {
-                            task.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                            if !self.ai_busy { self.ai_task = None; }
-                        }
-                    }
-                });
-                if let Some((backup, instance)) = self.ai_backup.clone() {
-                    ui.small("Откат вернёт моды и параметры к состоянию перед последним исправлением.");
-                    if ui.add_enabled(!self.ai_busy && self.ai_task.is_none() && !self.busy
-                        && self.sessions.is_empty() && !self.content_mutation_busy(),
-                        egui::Button::new("Откатить последнее исправление")).clicked()
-                    {
-                        let (tx, ctx) = (self.tx.clone(), ctx.clone());
-                        self.ai_busy = true;
-                        self.busy = true;
-                        std::thread::spawn(move || {
-                            let _ = tx.send(Event::AiUndone(agent::undo(&backup, &instance)));
-                            ctx.request_repaint();
-                        });
-                    }
-                }
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("Подготовить отчёт").clicked() {
-                        self.prepare_ai_report();
-                    }
-                    if ui.button("Настройка API").clicked() {
-                        self.settings_tab = SettingsTab::Services;
-                        self.navigate(Page::Settings);
-                    }
-                });
-                if ui.button("Добавить crash-report / latest.log…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Журнал", &["log", "txt"])
-                        .pick_file()
-                    {
-                        use std::io::Read;
-                        let result = std::fs::File::open(&path).and_then(|f| {
-                            let mut bytes = vec![];
-                            f.take(256 * 1024 + 1).read_to_end(&mut bytes)?;
-                            Ok(bytes)
-                        });
-                        match result {
-                            Ok(bytes) if bytes.len() <= 256 * 1024 => {
-                                if self.ai_report.is_empty() {
-                                    self.prepare_ai_report();
-                                }
-                                let report = format!(
-                                    "{}\n\nДополнительный журнал:\n{}",
-                                    self.ai_report,
-                                    String::from_utf8_lossy(&bytes)
-                                );
-                                self.ai_report = self.sanitize_ai_report(&report);
-                            }
-                            Ok(_) => self.ai_answer =
-                                "Файл больше 256 КиБ. Вставьте только фрагмент с ошибкой в отчёт."
-                                    .into(),
-                            Err(error) => {
-                                self.ai_answer = format!("Не удалось прочитать журнал: {error}")
-                            }
-                        }
-                    }
-                }
-                if !self.ai_report.is_empty() {
-                    ui.label("Проверьте данные. Этот текст будет передан выбранному вами API:");
                     ui.add(
-                        egui::TextEdit::multiline(&mut self.ai_report)
-                            .desired_rows(8)
+                        egui::TextEdit::multiline(&mut self.ai_question)
+                            .desired_rows(2)
                             .desired_width(f32::INFINITY),
                     );
-                    ui.label(format!("Получатель: {}", self.effective_ai().0.endpoint));
-                    if ui
-                        .add_enabled(
-                            !self.ai_busy && self.ai_task.is_none(),
-                            egui::Button::new("Подтверждаю отправку — проанализировать"),
-                        )
-                        .clicked()
-                    {
-                        let (settings, key) = self.effective_ai();
-                        let report = self.sanitize_ai_report(&self.ai_report);
-                        let (tx, ctx) = (self.tx.clone(), ctx.clone());
-                        self.ai_busy = true;
-                        std::thread::spawn(move || {
-                            let _ =
-                                tx.send(Event::Analysis(assistant::analyze(settings, key, report)));
-                            ctx.request_repaint();
-                        });
+                    ui.small(format!("Запрос, параметры сборки и журналы будут переданы в {}. При включённом автоисправлении после сбоя они отправляются повторно.", self.effective_ai().0.endpoint));
+                    let old_settings = serde_json::to_string(&self.config.assistant).unwrap_or_default();
+                    ui.checkbox(&mut self.config.assistant.auto_repair, "Автоматически исправлять сбои ИИ-запуска");
+                    ui.add(egui::Slider::new(&mut self.config.assistant.max_repairs, 1..=3).text("Попыток исправления"));
+                    if old_settings != serde_json::to_string(&self.config.assistant).unwrap_or_default() {
+                        let result = self.config.save(&self.root);
+                        self.result(result, "");
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        let enabled = !self.ai_busy && self.ai_task.is_none() && !self.busy
+                            && self.sessions.is_empty() && !self.content_mutation_busy() && !self.ai_question.trim().is_empty();
+                        if ui.add_enabled(enabled, egui::Button::new("Создать сборку с ИИ")).clicked() {
+                            self.begin_ai_task(ctx, false);
+                        }
+                        if ui.add_enabled(enabled, egui::Button::new("Исправить текущую сборку")).clicked() {
+                            self.begin_ai_task(ctx, true);
+                        }
+                        if let Some(task) = &self.ai_task {
+                            if ui.button("Остановить автоматизацию").clicked() {
+                                task.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                                if !self.ai_busy { self.ai_task = None; }
+                            }
+                        }
+                    });
+                    if let Some((backup, instance)) = self.ai_backup.clone() {
+                        ui.small("Откат вернёт моды и параметры к состоянию перед последним исправлением.");
+                        if ui.add_enabled(!self.ai_busy && self.ai_task.is_none() && !self.busy
+                            && self.sessions.is_empty() && !self.content_mutation_busy(),
+                            egui::Button::new("Откатить последнее исправление")).clicked()
+                        {
+                            let (tx, ctx) = (self.tx.clone(), ctx.clone());
+                            self.ai_busy = true;
+                            self.busy = true;
+                            std::thread::spawn(move || {
+                                let _ = tx.send(Event::AiUndone(agent::undo(&backup, &instance)));
+                                ctx.request_repaint();
+                            });
+                        }
+                    }
+                } else {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Подготовить отчёт").clicked() {
+                            self.prepare_ai_report();
+                        }
+                        if ui.button("Настройка API").clicked() {
+                            self.settings_tab = SettingsTab::Services;
+                            self.navigate(Page::Settings);
+                        }
+                    });
+                    if ui.button("Добавить crash-report / latest.log…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Журнал", &["log", "txt"])
+                            .pick_file()
+                        {
+                            use std::io::Read;
+                            let result = std::fs::File::open(&path).and_then(|f| {
+                                let mut bytes = vec![];
+                                f.take(256 * 1024 + 1).read_to_end(&mut bytes)?;
+                                Ok(bytes)
+                            });
+                            match result {
+                                Ok(bytes) if bytes.len() <= 256 * 1024 => {
+                                    if self.ai_report.is_empty() {
+                                        self.prepare_ai_report();
+                                    }
+                                    let report = format!(
+                                        "{}\n\nДополнительный журнал:\n{}",
+                                        self.ai_report,
+                                        String::from_utf8_lossy(&bytes)
+                                    );
+                                    self.ai_report = self.sanitize_ai_report(&report);
+                                }
+                                Ok(_) => self.ai_answer =
+                                    "Файл больше 256 КиБ. Вставьте только фрагмент с ошибкой в отчёт."
+                                        .into(),
+                                Err(error) => {
+                                    self.ai_answer = format!("Не удалось прочитать журнал: {error}")
+                                }
+                            }
+                        }
+                    }
+                    if !self.ai_report.is_empty() {
+                        ui.label("Проверьте данные. Этот текст будет передан выбранному вами API:");
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.ai_report)
+                                .desired_rows(8)
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.label(format!("Получатель: {}", self.effective_ai().0.endpoint));
+                        if ui
+                            .add_enabled(
+                                !self.ai_busy && self.ai_task.is_none(),
+                                egui::Button::new("Подтверждаю отправку — проанализировать"),
+                            )
+                            .clicked()
+                        {
+                            let (settings, key) = self.effective_ai();
+                            let report = self.sanitize_ai_report(&self.ai_report);
+                            let (tx, ctx) = (self.tx.clone(), ctx.clone());
+                            self.ai_busy = true;
+                            std::thread::spawn(move || {
+                                let _ =
+                                    tx.send(Event::Analysis(assistant::analyze(settings, key, report)));
+                                ctx.request_repaint();
+                            });
+                        }
                     }
                 }
                 if self.ai_busy {
@@ -4995,6 +5090,13 @@ impl eframe::App for Launcher {
         }
         self.pacing.begin(_frame, self.background.throttle_signal());
         self.render(ctx);
+        let id = self.config.discord_application.trim();
+        self.discord.update(id.parse::<u64>().ok().filter(|id| *id > 0).map(|_| discord::Activity {
+            application: id.to_owned(),
+            build: self.sessions.iter().rev().find(|s| s.running)
+                .filter(|s| s.show_in_discord)
+                .map(|s| (s.name.clone(), s.version.clone())),
+        }));
         #[cfg(windows)]
         if self.install_update_pending
             && self.sessions.is_empty()
@@ -5244,6 +5346,7 @@ mod ui_tests {
                 name: format!("Session {id}"),
                 version: "1.21.1".into(),
                 capture_logs: true,
+                show_in_discord: false,
                 instance: root.path().join(format!("{id}")),
                 cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 running: true,

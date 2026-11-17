@@ -1,7 +1,7 @@
 //! Modpack exchange and content downloads. Imports are staged and never overwrite an instance.
 use crate::{
     downloads,
-    model::{self, Profile, SortOrder, Source},
+    model::{self, BuildIcon, Profile, SortOrder, Source},
 };
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -12,8 +12,10 @@ use std::{
     fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::atomic::AtomicBool,
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
+
+const PACK_DOWNLOAD_LIMIT: u64 = 12 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Provider {
@@ -763,6 +765,30 @@ impl Service {
         cancel: &AtomicBool,
         allow_unhashed: bool,
     ) -> Result<()> {
+        self.fetch_file(spec, path, cancel, allow_unhashed, None)
+    }
+
+    fn fetch_file(
+        &self,
+        spec: &FileSpec,
+        path: &Path,
+        cancel: &AtomicBool,
+        allow_unhashed: bool,
+        budget: Option<&AtomicU64>,
+    ) -> Result<()> {
+        let reserve = |bytes| -> Result<()> {
+            if let Some(budget) = budget {
+                anyhow::ensure!(
+                    budget
+                        .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                            left.checked_sub(bytes)
+                        })
+                        .is_ok(),
+                    "Сборка превышает 12 ГиБ"
+                );
+            }
+            Ok(())
+        };
         downloads::check_cancel(cancel)?;
         anyhow::ensure!(
             allow_unhashed
@@ -778,7 +804,7 @@ impl Service {
                 "Файл уже существует, но отличается от скачиваемого: {}. Переименуйте его вручную.",
                 spec.path
             );
-            return Ok(());
+            return reserve(path.metadata()?.len());
         }
         let mut response = self
             .client
@@ -804,6 +830,7 @@ impl Service {
             }
             size += n as u64;
             anyhow::ensure!(size <= 1024 * 1024 * 1024, "Файл больше 1 ГиБ");
+            reserve(n as u64)?;
             sha1.update(&buffer[..n]);
             sha256.update(&buffer[..n]);
             sha512.update(&buffer[..n]);
@@ -962,7 +989,28 @@ impl Service {
                 &json!({"name":manifest.name,"project":e.id,"source":e.provider.label(),"version":version}),
             )?,
         )?;
-        finish(manifest, &destination, instances, cancel)
+        let icon = if !e.icon_url.is_empty() {
+            downloads::check_cancel(cancel)?;
+            let saved = (|| {
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()?;
+                let bytes = crate::media::download_icon_bytes(&client, &e.icon_url)?;
+                crate::media::decode_image(&bytes, 64, 64)?;
+                downloads::atomic_write(&crate::icons::custom_path(&destination), &bytes)
+            })();
+            match saved {
+                Ok(()) => BuildIcon::Custom,
+                Err(error) => {
+                    progress(format!("Не удалось сохранить значок сборки: {error}"));
+                    BuildIcon::default()
+                }
+            }
+        } else {
+            BuildIcon::default()
+        };
+        finish(manifest, &destination, instances, cancel, icon)
     }
     pub fn import(
         &self,
@@ -976,7 +1024,13 @@ impl Service {
         let destination = stage.path().join("game");
         fs::create_dir(&destination)?;
         let manifest = self.unpack(archive, &destination, cancel, progress)?;
-        finish(manifest, &destination, instances, cancel)
+        finish(
+            manifest,
+            &destination,
+            instances,
+            cancel,
+            BuildIcon::default(),
+        )
     }
     fn download_plan(
         &self,
@@ -987,25 +1041,64 @@ impl Service {
     ) -> Result<()> {
         anyhow::ensure!(files.len() <= 30000, "Слишком много файлов");
         let mut names = HashSet::new();
-        let mut total = 0u64;
-        for (i, file) in files.iter().enumerate() {
+        let mut plan = Vec::with_capacity(files.len());
+        let mut known_size = 0u64;
+        for file in files {
+            downloads::check_cancel(cancel)?;
             let path = game_path(&file.path)?;
             anyhow::ensure!(
                 names.insert(file.path.to_lowercase()),
                 "Повтор пути {}",
                 file.path
             );
-            progress(format!("Файл {}/{}: {}", i + 1, files.len(), file.path));
             let mut resolved = file.clone();
             if let Some((project, version)) = &file.curseforge {
                 let current = self.cf_file(project, version)?;
                 resolved.url = current.url;
+                resolved.size = resolved.size.or(current.size);
             }
-            self.fetch(&resolved, &destination.join(path), cancel, false)?;
-            total += destination.join(game_path(&file.path)?).metadata()?.len();
-            anyhow::ensure!(total <= 12 * 1024 * 1024 * 1024, "Сборка превышает 12 ГиБ");
+            known_size = known_size.saturating_add(resolved.size.unwrap_or(0));
+            anyhow::ensure!(known_size <= PACK_DOWNLOAD_LIMIT, "Сборка превышает 12 ГиБ");
+            plan.push((resolved, destination.join(path)));
         }
-        Ok(())
+        plan.sort_by_key(|(file, _)| file.size.unwrap_or(u64::MAX));
+        let next = AtomicUsize::new(0);
+        let budget = AtomicU64::new(PACK_DOWNLOAD_LIMIT);
+        let failed = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            for _ in 0..plan.len().min(6) {
+                let (plan, next, budget, failed, tx) = (&plan, &next, &budget, &failed, tx.clone());
+                scope.spawn(move || {
+                    while !failed.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) {
+                        let Some((file, path)) = plan.get(next.fetch_add(1, Ordering::Relaxed))
+                        else {
+                            break;
+                        };
+                        let result = self.fetch_file(file, path, cancel, false, Some(budget));
+                        if result.is_err() {
+                            failed.store(true, Ordering::Relaxed);
+                        }
+                        let _ = tx.send((&file.path, result));
+                    }
+                });
+            }
+            drop(tx);
+            let mut completed = 0;
+            let mut outcome = Ok(());
+            for (path, result) in rx {
+                match result {
+                    Ok(()) => {
+                        completed += 1;
+                        progress(format!("Файл {completed}/{}: {path}", plan.len()));
+                    }
+                    Err(error) if outcome.is_ok() => outcome = Err(error),
+                    Err(_) => {}
+                }
+            }
+            outcome?;
+            downloads::check_cancel(cancel)
+        })
     }
     fn unpack(
         &self,
@@ -1550,7 +1643,13 @@ fn validate_manifest(m: &Manifest) -> Result<()> {
     }
     Ok(())
 }
-fn finish(m: Manifest, staged: &Path, instances: &Path, cancel: &AtomicBool) -> Result<Profile> {
+fn finish(
+    m: Manifest,
+    staged: &Path,
+    instances: &Path,
+    cancel: &AtomicBool,
+    icon: BuildIcon,
+) -> Result<Profile> {
     validate_manifest(&m)?;
     downloads::check_cancel(cancel)?;
     downloads::atomic_write(
@@ -1571,12 +1670,108 @@ fn finish(m: Manifest, staged: &Path, instances: &Path, cancel: &AtomicBool) -> 
     Ok(Profile {
         privacy: Default::default(),
         java: None,
-        icon: Default::default(),
+        icon,
         name: m.name,
         game_version: m.minecraft,
         loader: m.loader,
         directory,
     })
+}
+
+pub fn merge_builds(
+    base: &Profile,
+    other: &Profile,
+    instances: &Path,
+    cancel: &AtomicBool,
+) -> Result<Profile> {
+    anyhow::ensure!(
+        base.directory != other.directory
+            && base.game_version == other.game_version
+            && base.loader == other.loader,
+        "Для объединения нужны две сборки с одинаковой версией Minecraft и загрузчиком"
+    );
+    let left = instances.join(safe_path(&base.directory)?);
+    let right = instances.join(safe_path(&other.directory)?);
+    let root = instances.canonicalize()?;
+    for folder in [&left, &right] {
+        let canonical = folder.canonicalize()?;
+        anyhow::ensure!(
+            canonical.parent() == Some(root.as_path())
+                && canonical.file_name() == folder.file_name(),
+            "Путь сборки указывает на другую папку"
+        );
+    }
+    let (left_loader, right_loader) = (read_loader(&left), read_loader(&right));
+    anyhow::ensure!(
+        left_loader.is_empty() || right_loader.is_empty() || left_loader == right_loader,
+        "Сборки закреплены за разными версиями загрузчика"
+    );
+    let stage = tempfile::tempdir_in(instances)?;
+    let mut copied: std::collections::HashMap<String, PathBuf> = Default::default();
+    for source in [&left, &right] {
+        let mut files = Vec::new();
+        collect_export(source, source, &mut files)?;
+        for (relative, path) in files {
+            downloads::check_cancel(cancel)?;
+            let key = relative.to_lowercase();
+            if let Some(previous) = copied.get(&key) {
+                anyhow::ensure!(
+                    file_sha256(previous)? == file_sha256(&path)?,
+                    "Конфликт файлов: {relative}"
+                );
+            } else {
+                let target = stage.path().join(game_path(&relative)?);
+                fs::create_dir_all(target.parent().context("Нет папки назначения")?)?;
+                crate::migration::copy(&path, &target, cancel)?;
+                copied.insert(key, target);
+            }
+        }
+    }
+    let mut installed = model::installed(&left)?;
+    for item in model::installed(&right)? {
+        if let Some(previous) = installed
+            .iter()
+            .find(|m| m.source == item.source && m.project_id == item.project_id)
+        {
+            anyhow::ensure!(
+                previous.filename.eq_ignore_ascii_case(&item.filename),
+                "Две версии мода {}",
+                item.name
+            );
+        } else {
+            installed.push(item);
+        }
+    }
+    downloads::atomic_write(
+        &stage.path().join("mods.json"),
+        &serde_json::to_vec_pretty(&installed)?,
+    )?;
+    let mut refs = read_refs(&left);
+    for item in read_refs(&right) {
+        if !refs.iter().any(|f| f.path.eq_ignore_ascii_case(&item.path)) {
+            refs.push(item);
+        }
+    }
+    let mut profile = finish(
+        Manifest {
+            format: 1,
+            name: format!("{} + {}", base.name, other.name),
+            minecraft: base.game_version.clone(),
+            loader: base.loader.clone(),
+            loader_version: if left_loader.is_empty() {
+                right_loader
+            } else {
+                left_loader
+            },
+            files: refs,
+        },
+        stage.path(),
+        instances,
+        cancel,
+        BuildIcon::default(),
+    )?;
+    profile.java = base.java.clone();
+    Ok(profile)
 }
 pub fn map_path(instance: &Path, entry: &Entry) -> PathBuf {
     let name = model::directory_from_name(&entry.name);
@@ -1725,6 +1920,7 @@ fn collect_export(root: &Path, current: &Path, files: &mut Vec<(String, PathBuf)
                 | "scripts"
                 | "patchouli_books"
                 | "global_packs"
+                | "datapacks"
                 | "options.txt"
                 | "optionsof.txt"
         ) {
@@ -2047,6 +2243,28 @@ mod tests {
         fs::write(&path, b"user-edited").unwrap();
         assert!(service.fetch(&spec, &path, &cancel, false).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"user-edited");
+    }
+
+    #[test]
+    fn merge_builds_preserves_sources_and_rejects_conflicting_files() {
+        let root = tempfile::tempdir().unwrap();
+        let base = model::Config::default().profiles.remove(0);
+        let mut other = base.clone();
+        other.name = "Second".into();
+        other.directory = "Second".into();
+        let original = root.path().join(&base.directory).join("mods/left.jar");
+        let additional = root.path().join(&other.directory).join("mods/right.jar");
+        downloads::atomic_write(&original, b"left").unwrap();
+        downloads::atomic_write(&additional, b"right").unwrap();
+        let cancel = AtomicBool::new(false);
+        let merged = merge_builds(&base, &other, root.path(), &cancel).unwrap();
+        let path = root.path().join(merged.directory);
+        assert_eq!(fs::read(path.join("mods/left.jar")).unwrap(), b"left");
+        assert_eq!(fs::read(path.join("mods/right.jar")).unwrap(), b"right");
+        downloads::atomic_write(&additional.with_file_name("left.jar"), b"different").unwrap();
+        assert!(merge_builds(&base, &other, root.path(), &cancel).is_err());
+        assert_eq!(fs::read(original).unwrap(), b"left");
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 3);
     }
     fn entry(name: &str, downloads: u64, updated: &str, published: &str) -> Entry {
         Entry {

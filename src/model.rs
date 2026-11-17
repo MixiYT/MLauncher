@@ -64,6 +64,7 @@ pub struct Profile {
 pub struct BuildPrivacy {
     pub hide_mods: bool,
     pub disable_logs: bool,
+    pub show_in_discord: bool,
 }
 
 /// Безопасное имя папки из названия сборки. Никаких разделителей и зарезервированных имён Windows.
@@ -203,6 +204,8 @@ pub struct Config {
     pub on_game_start: OnGameStart,
     #[serde(default)]
     pub horizon: HorizonSettings,
+    #[serde(default = "default_discord_application")]
+    pub discord_application: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -278,8 +281,13 @@ impl Default for Config {
             curseforge_manual: false,
             on_game_start: OnGameStart::default(),
             horizon: HorizonSettings::default(),
+            discord_application: default_discord_application(),
         }
     }
+}
+
+fn default_discord_application() -> String {
+    "1572066126119043113".into()
 }
 
 impl Config {

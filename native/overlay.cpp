@@ -38,8 +38,12 @@ static ImGuiContext* context=nullptr;
 static std::atomic<bool> visible{false},busy{false},rendererReady{false};
 static std::mutex dataMutex,pollMutex;
 static std::condition_variable pollWake;
-static json data={{"entries",json::array()},{"logs",json::array()},{"name","Minecraft"},{"status",""}};
+static json data={{"entries",json::array()},{"status",""}};
 static std::atomic<unsigned> revision{1};
+static json gameLogs=json::array();
+static std::string gameName="Minecraft";
+static unsigned catalogOpening=0;
+static char resourceQuery[257]{}, mapQuery[257]{};
 static std::wstring token;
 static INTERNET_PORT port=0;
 static RECT previousClip{};
@@ -152,6 +156,7 @@ static void setVisible(bool show) {
         }
         GetClipCursor(&previousClip);ReleaseCapture();
         visible.store(true);
+        ++catalogOpening;
         if(originalClip)originalClip(nullptr);
         cursorChanges=0;
         do{++cursorChanges;}while(ShowCursor(TRUE)<0&&cursorChanges<32);
@@ -200,26 +205,29 @@ static LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM w,LPARAM l) {
 }
 static void runJob(const std::wstring& path,json body) {
     if(busy.exchange(true))return;
-    {std::lock_guard<std::mutex> lock(dataMutex);data["status"]="Загрузка…";++revision;}
+    {std::lock_guard<std::mutex> lock(dataMutex);data["status"]="Загрузка…";data["failed"]=false;++revision;}
     std::thread([path,body]{
         try{
             json result=rpc(path.c_str(),&body);
             std::lock_guard<std::mutex> lock(dataMutex);
-            if(result.contains("error"))data["status"]=result["error"];
+            if(result.contains("error")){data["status"]=result["error"];data["failed"]=true;}
             else if(path==L"/resources" || path==L"/maps"){
-                data["maps"] = path == L"/maps";
-                data["catalog_revision"] = data.value("catalog_revision", 0u) + 1;
+                if (!body.value("append", false)) {
+                    data["catalog_revision"] = data.value("catalog_revision", 0u) + 1;
+                    data["entries"] = json::array();
+                }
                 data["provider"]=body["provider"];
-                data["entries"]=result.value("entries",json::array());
-                data["name"]=result.value("name",std::string("Minecraft"));
-                data["minecraft"]=result.value("minecraft",std::string());
+                data["signature"]=body["signature"];
+                for (auto& item : result["entries"]) data["entries"].push_back(std::move(item));
+                data["more"]=result.value("more",false);
+                data["offset"]=result.value("offset",0u);
                 data["status"]="";
             }else{
                 data["status"]=result.value("message",std::string("Готово"));
                 for(auto& entry:data["entries"])if(entry["id"]==body["id"])entry["installed"]=true;
             }
             ++revision;
-        }catch(const std::exception& error){std::lock_guard<std::mutex> lock(dataMutex);data["status"]=error.what();++revision;}
+        }catch(const std::exception& error){std::lock_guard<std::mutex> lock(dataMutex);data["status"]=error.what();data["failed"]=true;++revision;}
         busy.store(false);
     }).detach();
 }
@@ -229,8 +237,8 @@ static void pollLogs() {
         try{
             const json result=rpc(L"/logs");
             std::lock_guard<std::mutex> lock(dataMutex);
-            if(result.contains("logs")){data["logs"]=result["logs"];data["name"]=result.value("name",std::string("Minecraft"));++revision;}
-        }catch(const std::exception& error){std::lock_guard<std::mutex> lock(dataMutex);data["status"]=error.what();++revision;}
+            if(result.contains("logs")){gameLogs=result["logs"];gameName=result.value("name",std::string("Minecraft"));}
+        }catch(const std::exception&){}
         std::this_thread::sleep_for(std::chrono::milliseconds(750));
     }
 }
@@ -274,8 +282,10 @@ static GLuint catalogTexture(const json& entry) {
 }
 
 static void drawCatalog(const json& snapshot, bool maps) {
-    static char resourceQuery[257]{}, mapQuery[257]{};
     static int provider = 0, sort = 0, mapSort = 0;
+    static json desired, attempted;
+    static double searchAt = 0.0;
+    static unsigned lastPage = 0;
     char* query = maps ? mapQuery : resourceQuery;
     int& order = maps ? mapSort : sort;
     if (!maps) {
@@ -292,23 +302,44 @@ static void drawCatalog(const json& snapshot, bool maps) {
     ImGui::BeginDisabled(busy.load());
     search = ImGui::Button("Найти") || search;
     ImGui::EndDisabled();
-    if (search && !busy.load()) {
-        static const char* sorts[] = {"downloads", "relevance", "updated", "newest"};
+    static const char* sorts[] = {"downloads", "relevance", "updated", "newest"};
+    const json signature = {maps, catalogOpening, query, provider, order};
+    if (signature != desired) {
+        searchAt = ImGui::GetTime() + (desired.is_array() && desired[1] == catalogOpening ? .35 : 0.);
+        desired = signature;
+    }
+    const auto request = [&](bool append, unsigned offset) {
         runJob(maps ? L"/maps" : L"/resources", {
             {"query", query}, {"provider", maps || provider == 1 ? "curseforge" : "modrinth"},
-            {"sort", sorts[order]}
+            {"sort", sorts[order]}, {"signature", signature}, {"append", append}, {"offset", offset}
         });
+    };
+    if (!busy.load() && (search || (attempted != signature && ImGui::GetTime() >= searchAt))) {
+        attempted = signature;
+        lastPage = 0;
+        request(false, 0);
+        return;
     }
     const auto status = snapshot.value("status", std::string());
     if (!status.empty()) ImGui::TextWrapped("%s", status.c_str());
-    if (snapshot.value("maps", false) != maps) return;
+    if (snapshot.value("signature", json()) != signature) return;
     const unsigned revision = snapshot.value("catalog_revision", 0u);
-    if (textureRevision != revision) {
+    const bool resetScroll = textureRevision != revision;
+    if (resetScroll) {
         clearCatalogTextures();
         textureRevision = revision;
     }
+    if (snapshot.at("entries").empty()) {
+        ImGui::TextUnformatted("Ничего не найдено");
+        return;
+    }
     ImGui::BeginChild("cards", ImVec2(0, 0), true);
-    for (const auto& entry : snapshot.at("entries")) {
+    if (resetScroll) ImGui::SetScrollY(0);
+    const auto& entries = snapshot.at("entries");
+    ImGuiListClipper clipper;
+    clipper.Begin(static_cast<int>(entries.size()));
+    while (clipper.Step()) for (int index=clipper.DisplayStart; index<clipper.DisplayEnd; ++index) {
+        const auto& entry = entries[index];
         const auto id = entry.value("id", std::string());
         ImGui::PushID(id.c_str());
         const GLuint texture = catalogTexture(entry);
@@ -316,9 +347,9 @@ static void drawCatalog(const json& snapshot, bool maps) {
         else ImGui::Dummy(ImVec2(48, 48));
         ImGui::SameLine();
         ImGui::BeginGroup();
-        ImGui::TextWrapped("%s", entry.value("name", std::string()).c_str());
+        ImGui::TextUnformatted(entry.value("name", std::string()).c_str());
         ImGui::TextDisabled("%s", entry.value("author", std::string()).c_str());
-        ImGui::TextWrapped("%s", entry.value("description", std::string()).c_str());
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", entry.value("description", std::string()).c_str());
         const bool installed = entry.value("installed", false);
         ImGui::BeginDisabled(busy.load() || installed);
         if (ImGui::Button(installed ? "Установлено" : "Скачать")) {
@@ -330,6 +361,16 @@ static void drawCatalog(const json& snapshot, bool maps) {
         ImGui::EndGroup();
         ImGui::Separator();
         ImGui::PopID();
+    }
+    if (!resetScroll && !busy.load() && snapshot.value("more", false)) {
+        const auto offset = snapshot.value("offset", 0u);
+        const bool failed = snapshot.value("failed", false);
+        const bool load = failed ? ImGui::Button("Повторить загрузку страницы") :
+            offset != lastPage && ImGui::GetScrollY() + 160.f >= ImGui::GetScrollMaxY();
+        if (load) {
+            lastPage = offset;
+            request(true, offset);
+        }
     }
     ImGui::EndChild();
 }
@@ -350,7 +391,9 @@ static void drawOverlay() {
     ImGui::SetNextWindowPos(ImVec2(screen.x*.5f,screen.y*.5f),placement,ImVec2(.5f,.5f));
     bool open=true;
     if(ImGui::Begin("MLauncher · Shift+Tab / Esc",&open,ImGuiWindowFlags_NoCollapse)){
-        ImGui::TextUnformatted(snapshot.value("name",std::string("Minecraft")).c_str());
+        std::string name;
+        {std::lock_guard<std::mutex> lock(dataMutex);name=gameName;}
+        ImGui::TextUnformatted(name.c_str());
         if(ImGui::BeginTabBar("overlay-tabs")){
             if (ImGui::BeginTabItem("Ресурспаки")) {
                 drawCatalog(snapshot, false);
@@ -364,7 +407,9 @@ static void drawOverlay() {
                 static bool follow=true;ImGui::Checkbox("Прокручивать вниз",&follow);
                 ImGui::BeginChild("logs",ImVec2(0,0),true,ImGuiWindowFlags_HorizontalScrollbar);
                 const bool atBottom=ImGui::GetScrollY()>=ImGui::GetScrollMaxY()-2.f;
-                if(const auto logs=snapshot.find("logs");logs!=snapshot.end()&&logs->is_array()){
+                std::lock_guard<std::mutex> lock(dataMutex);
+                const auto logs=&gameLogs;
+                if(logs->is_array()){
                     ImGuiListClipper clipper;
                     clipper.Begin(static_cast<int>(logs->size()),ImGui::GetTextLineHeightWithSpacing());
                     while(clipper.Step())for(int row=clipper.DisplayStart;row<clipper.DisplayEnd;++row){
@@ -467,7 +512,7 @@ static BOOL WINAPI swapHook(HDC dc) {
                 if(n&&n<257){
                     const int length=WideCharToMultiByte(CP_UTF8,0,query,-1,nullptr,0,nullptr,nullptr);
                     std::string utf8(length,'\0');WideCharToMultiByte(CP_UTF8,0,query,-1,utf8.data(),length,nullptr,nullptr);utf8.pop_back();
-                    runJob(L"/resources",{{"query",utf8},{"provider","modrinth"},{"sort","downloads"}});
+                    strncpy_s(resourceQuery,sizeof(resourceQuery),utf8.c_str(),_TRUNCATE);
                 }
             }
         }

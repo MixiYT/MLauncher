@@ -583,6 +583,10 @@ impl Drop for Thumbnails {
     }
 }
 pub(crate) fn download_icon(client: &reqwest::blocking::Client, url: &str) -> Result<ColorImage> {
+    decode_image(&download_icon_bytes(client, url)?, 96, 96)
+}
+
+pub(crate) fn download_icon_bytes(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<u8>> {
     let parsed = reqwest::Url::parse(url)?;
     if parsed.scheme() != "https" || !parsed.host_str().is_some_and(icon_host_allowed) {
         bail!("Недопустимый CDN иконки");
@@ -593,7 +597,7 @@ pub(crate) fn download_icon(client: &reqwest::blocking::Client, url: &str) -> Re
     if bytes.len() > 4 * 1024 * 1024 {
         bail!("Иконка слишком большая");
     }
-    decode_image(&bytes, 96, 96)
+    Ok(bytes)
 }
 
 fn icon_host_allowed(host: &str) -> bool {
