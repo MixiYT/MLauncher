@@ -20,13 +20,17 @@ pub fn key(account: &Account) -> String {
     } else {
         ""
     };
-    format!(
+    let key = format!(
         "{}-{}-{}-{}",
         crate::auth::kind_key(account.kind),
         account.uuid,
         name,
-        account.ely_skins
-    )
+        account.ely_skins,
+    );
+    match &account.local_skin {
+        Some(skin) => format!("{key}-{}", skin.sha256),
+        None => key,
+    }
 }
 impl Avatars {
     pub fn refresh(&mut self, accounts: &[Account], root: &std::path::Path, ctx: &egui::Context) {
@@ -38,7 +42,7 @@ impl Avatars {
                     id.clone(),
                     ctx.load_texture(&id, fallback(&a.uuid), TextureOptions::NEAREST),
                 );
-                if a.kind == AccountKind::Offline && !a.ely_skins {
+                if a.kind == AccountKind::Offline && !a.ely_skins && a.local_skin.is_none() {
                     continue;
                 }
                 jobs.push((
@@ -46,6 +50,7 @@ impl Avatars {
                     a.name.clone(),
                     a.uuid.clone(),
                     a.kind == AccountKind::ElyBy || a.ely_skins,
+                    a.local_skin.clone(),
                 ));
             }
         }
@@ -54,7 +59,7 @@ impl Avatars {
         }
         let (tx, rx) = mpsc::channel();
         self.receivers.push(rx);
-        let root = root.join("avatars");
+        let root = root.to_path_buf();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let Ok(client) = reqwest::blocking::Client::builder()
@@ -66,8 +71,18 @@ impl Avatars {
             };
             // Publish every cached face before waiting for any network request.
             let mut refresh = Vec::new();
-            for (id, name, uuid, ely) in jobs {
-                let cache = root.join(format!("{}.png", crate::model::directory_from_name(&id)));
+            for (id, name, uuid, ely, local) in jobs {
+                if let Some(local) = local {
+                    if let Some(image) = local.path(&root).and_then(|path| std::fs::read(path).ok()).and_then(|bytes| face(&bytes).ok()) {
+                        let _ = tx.send((id, image));
+                        ctx.request_repaint();
+                        continue;
+                    }
+                    if !ely {
+                        continue;
+                    }
+                }
+                let cache = root.join("avatars").join(format!("{}.png", crate::model::directory_from_name(&id)));
                 let cached = std::fs::read(&cache).ok().and_then(|b| face(&b).ok());
                 let valid = cached.is_some();
                 if let Some(image) = cached {
@@ -79,7 +94,13 @@ impl Avatars {
                 }
             }
             for (id, name, uuid, ely, cache) in refresh {
-                if let Ok(bytes) = skin(&client, &name, &uuid, ely) {
+                let bytes = if ely {
+                    crate::skins::ely(&root, &name).ok().flatten()
+                        .and_then(|skin| skin.path(&root)).and_then(|path| std::fs::read(path).ok())
+                } else {
+                    microsoft_skin(&client, &uuid).ok()
+                };
+                if let Some(bytes) = bytes {
                     if let Ok(image) = face(&bytes) {
                         let _ = crate::downloads::atomic_write(&cache, &bytes);
                         let _ = tx.send((id, image));
@@ -125,14 +146,7 @@ fn bounded(response: reqwest::blocking::Response) -> Result<Vec<u8>> {
     anyhow::ensure!(bytes.len() <= 4 * 1024 * 1024, "Скин слишком большой");
     Ok(bytes)
 }
-fn skin(client: &reqwest::blocking::Client, name: &str, uuid: &str, ely: bool) -> Result<Vec<u8>> {
-    let url = if ely {
-        let mut url = reqwest::Url::parse("https://skinsystem.ely.by/skins/")?;
-        url.path_segments_mut()
-            .map_err(|_| anyhow::anyhow!("URL"))?
-            .push(name);
-        url
-    } else {
+fn microsoft_skin(client: &reqwest::blocking::Client, uuid: &str) -> Result<Vec<u8>> {
         let uuid = uuid.replace('-', "");
         anyhow::ensure!(
             uuid.len() == 32 && uuid.chars().all(|c| c.is_ascii_hexdigit()),
@@ -166,9 +180,7 @@ fn skin(client: &reqwest::blocking::Client, name: &str, uuid: &str, ely: bool) -
             "Недопустимый сервер скинов"
         );
         let _ = url.set_scheme("https");
-        url
-    };
-    bounded(client.get(url).send()?)
+        bounded(client.get(url).send()?)
 }
 fn face(bytes: &[u8]) -> Result<ColorImage> {
     // Bound decoding before cropping; skins can have HD dimensions.

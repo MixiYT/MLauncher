@@ -269,11 +269,41 @@ pub fn select(
     if !settings.auto_download {
         bail!("Java {major} не найдена. Выберите путь или включите автоматическую загрузку.");
     }
+    let executable = install_temurin(storage, major, "jre", cancel, progress)?;
+    let _ = fs::write(&marker, executable.to_string_lossy().as_bytes());
+    Ok(executable)
+}
+
+pub fn jdk_home(
+    storage: &Path,
+    major: u32,
+    cancel: &AtomicBool,
+    progress: &impl Fn(String),
+) -> Result<PathBuf> {
+    let javac = if cfg!(windows) { "javac.exe" } else { "javac" };
+    let java = match discover(storage).into_iter().find(|java| {
+        java.major == major && java.path.with_file_name(javac).is_file()
+    }) {
+        Some(java) => java.path,
+        None => install_temurin(storage, major, "jdk", cancel, progress)?,
+    };
+    anyhow::ensure!(java.with_file_name(javac).is_file(), "JDK {major} без javac");
+    Ok(java.parent().and_then(Path::parent).context("Папка JDK")?.to_owned())
+}
+
+fn install_temurin(
+    storage: &Path,
+    major: u32,
+    image_type: &str,
+    cancel: &AtomicBool,
+    progress: &impl Fn(String),
+) -> Result<PathBuf> {
     #[cfg(not(all(windows, target_arch = "x86_64")))]
     bail!("Автоустановка Java пока поддерживает Windows x64");
     let client = downloads::client()?;
-    let runtime = storage.join("runtimes").join(format!("temurin-{major}"));
-    let data=downloads::json(&client,&format!("https://api.adoptium.net/v3/assets/latest/{major}/hotspot?architecture=x64&image_type=jre&os=windows&vendor=eclipse"),&storage.join("metadata").join(format!("java-{major}.json")),cancel)?;
+    let runtime_name = if image_type == "jre" { format!("temurin-{major}") } else { format!("temurin-{image_type}-{major}") };
+    let runtime = storage.join("runtimes").join(runtime_name);
+    let data=downloads::json(&client,&format!("https://api.adoptium.net/v3/assets/latest/{major}/hotspot?architecture=x64&image_type={image_type}&os=windows&vendor=eclipse"),&storage.join("metadata").join(format!("java-{image_type}-{major}.json")),cancel)?;
     let package = &data
         .as_array()
         .and_then(|a| a.first())
@@ -318,9 +348,7 @@ pub fn select(
         );
     }
     fs::rename(temporary.path(), &runtime)?;
-    let executable = runtime.join(relative);
-    let _ = fs::write(&marker, executable.to_string_lossy().as_bytes());
-    Ok(executable)
+    Ok(runtime.join(relative))
 }
 pub fn jvm_args(settings: &JavaSettings, major: u32) -> Result<Vec<String>> {
     if settings.min_memory < 128

@@ -139,13 +139,26 @@ pub enum OnGameStart {
     Close,
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HorizonSettings {
     pub selected: bool,
-    pub launcher: PathBuf,
-    pub instance: String,
-    pub account: String,
+    pub build: PathBuf,
+    pub game_home: PathBuf,
+    pub auto_update: bool,
+    pub use_ely_session: bool,
+}
+
+impl Default for HorizonSettings {
+    fn default() -> Self {
+        Self {
+            selected: false,
+            build: PathBuf::new(),
+            game_home: PathBuf::new(),
+            auto_update: true,
+            use_ely_session: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

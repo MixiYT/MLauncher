@@ -1,6 +1,6 @@
 [package]
 name = "mlauncher"
-version = "0.3.18"
+version = "0.3.19"
 edition = "2021"
 description = "Rust Minecraft launcher with modpacks, resourcepacks and launch diagnostics"
 license = "MIT"
@@ -40,6 +40,7 @@ zeroize = "1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 rfd = "0.15"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+toml = "0.5"
 regex = "1"
 fs2 = "0.4"
 base64 = "0.22"

@@ -315,6 +315,7 @@ fn complete_login(
         uuid,
         kind: AccountKind::Microsoft,
         ely_skins: false,
+        local_skin: None,
         session: Some(Session {
             access_token: token.access_token,
             client_token: Zeroizing::new(uuid::Uuid::new_v4().to_string()),

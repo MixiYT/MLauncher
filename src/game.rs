@@ -823,6 +823,38 @@ fn assets(
         },
     ))
 }
+pub fn horizon_inputs(
+    client: &Client,
+    storage: &Path,
+    versions: &Path,
+    mc: &str,
+    cancel: &AtomicBool,
+    progress: &(impl Fn(String) + Sync),
+) -> Result<PathBuf> {
+    let metadata = metadata(client, storage, versions, mc, cancel)?.value;
+    let server = storage.join("versions").join(mc).join("server.jar");
+    for (kind, path) in [
+        ("client", storage.join("versions").join(mc).join(format!("{mc}.jar"))),
+        ("server", server.clone()),
+    ] {
+        progress(format!("Minecraft {mc} · {kind}…"));
+        let item = &metadata["downloads"][kind];
+        downloads::download(client, &Download {
+            url: string(item, "url")?.into(),
+            path,
+            checksum: Checksum::Sha1(string(item, "sha1")?.into()),
+            size: item["size"].as_u64(),
+        }, cancel)?;
+    }
+    let libraries = libraries(client, &metadata, None, storage, cancel)?;
+    progress(format!("Minecraft {mc} · библиотеки…"));
+    downloads::batch(client, &libraries.downloads, cancel, 12, |done, total| {
+        progress(format!("Библиотеки: {done}/{total}"));
+    })?;
+    assets(client, &metadata, storage, storage, cancel, progress)?;
+    Ok(server)
+}
+
 fn expand(value: &str, variables: &HashMap<String, String>) -> Result<String> {
     let mut value = value.to_owned();
     for (key, replacement) in variables {
@@ -862,6 +894,32 @@ struct Prepared {
     args: Vec<String>,
     secrets: Vec<Zeroizing<String>>,
 }
+fn loader_jvm_arguments(
+    loader: &Value,
+    variables: &HashMap<String, String>,
+    vanilla_jar: &Path,
+) -> Result<Vec<String>> {
+    let mut args = arguments(&loader["arguments"]["jvm"], variables)?;
+    let filename = vanilla_jar
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("Нет имени файла Minecraft")?;
+    let profile_jar = variables.get("version_name").map(|id| format!("{id}.jar"));
+    for arg in &mut args {
+        if let Some(ignored) = arg.strip_prefix("-DignoreList=") {
+            // BootstrapLauncher matches filenames. MLauncher keeps the vanilla client
+            // under the base version, while version_name is the loader profile ID.
+            if ignored.split(',').any(|item| Some(item) == profile_jar.as_deref())
+                && !ignored.split(',').any(|prefix| filename.starts_with(prefix))
+            {
+                arg.push(',');
+                arg.push_str(filename);
+            }
+        }
+    }
+    Ok(args)
+}
+
 fn prepare(
     request: &Request,
     cancel: &AtomicBool,
@@ -954,7 +1012,7 @@ fn prepare(
             progress(format!("Файлы игры: {done}/{total}"));
         }
     })?;
-    libraries.classpath.push(jar);
+    libraries.classpath.push(jar.clone());
     let natives = request.instance.join("launcher/natives");
     fs::create_dir_all(&natives)?;
     for path in &libraries.natives {
@@ -1063,7 +1121,7 @@ fn prepare(
         ]);
     }
     if let Some(loader) = &loader {
-        args.extend(arguments(&loader["arguments"]["jvm"], &variables)?);
+        args.extend(loader_jvm_arguments(loader, &variables, &jar)?);
     }
     if version["logging"]["client"]["file"].is_object() {
         let logging = &version["logging"]["client"];
@@ -1414,6 +1472,21 @@ fn extract_xml_versions(xml: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bootstrap_ignore_list_uses_the_installed_vanilla_filename() {
+        let variables = HashMap::from([("version_name".into(), "neoforge-21.1.265".into())]);
+        let jar = Path::new("versions/1.21.1/1.21.1.jar");
+        let loader = json!({"arguments":{"jvm":[
+            "-DignoreList=client-extra,${version_name}.jar", "-Dother=${version_name}"
+        ]}});
+        assert_eq!(
+            loader_jvm_arguments(&loader, &variables, jar).unwrap(),
+            ["-DignoreList=client-extra,neoforge-21.1.265.jar,1.21.1.jar", "-Dother=neoforge-21.1.265"]
+        );
+        let loader = json!({"arguments":{"jvm":["-DFabric=example"]}});
+        assert_eq!(loader_jvm_arguments(&loader, &variables, jar).unwrap(), ["-DFabric=example"]);
+    }
     #[test]
     fn sessions_can_lock_different_instances_but_not_the_same_one() {
         let root = tempfile::tempdir().unwrap();

@@ -13,6 +13,9 @@ mod downloads;
 mod effects;
 mod game;
 mod glass;
+mod horizon;
+mod horizon_mods;
+mod skins;
 mod icons;
 mod instance;
 mod java;
@@ -115,6 +118,8 @@ enum Event {
     JavaFound(Vec<java::Installation>),
     Game(u64, game::Event),
     HorizonFinished(anyhow::Result<()>),
+    HorizonProgress(String),
+    HorizonInstalled(anyhow::Result<()>),
     Analysis(anyhow::Result<String>),
     AiDefaults(anyhow::Result<ai_gateway::Defaults>),
     AiKeysUploaded(anyhow::Result<()>),
@@ -529,6 +534,7 @@ impl Launcher {
                             uuid: uuid.clone(),
                             kind,
                             ely_skins,
+                            local_skin: None,
                             session: Some(session),
                         })
                     }
@@ -825,58 +831,51 @@ impl Launcher {
         if self.horizon_running {
             return;
         }
-        let launcher = self.config.horizon.launcher.clone();
-        if !launcher.is_absolute() || !launcher.is_file() {
-            self.settings_tab = SettingsTab::Game;
-            self.navigate(Page::Settings);
-            self.result(
-                Err(anyhow::anyhow!(
-                    "Укажите исполняемый файл Semgas Horizon в настройках игры."
-                )),
-                "",
-            );
-            return;
-        }
-        let instance = self.config.horizon.instance.trim().to_owned();
-        let account = self.config.horizon.account.trim().to_owned();
-        let log_path = self.root.join("horizon-launch.log");
+        let settings = self.config.horizon.clone();
+        let root = self.root.clone();
+        let account = self.config.accounts.get(self.config.selected_account);
+        let player = account.map_or_else(horizon::Player::default, |account| horizon::Player {
+            name: account.name.clone(),
+            ely_skins: account.kind == auth::AccountKind::ElyBy || account.ely_skins,
+            local_skin: account.local_skin.clone(),
+        });
+        let ely_account = account.filter(|account| settings.use_ely_session && account.kind == auth::AccountKind::ElyBy);
+        let ely = if let Some(account) = ely_account {
+            match horizon::ElySession::from_account(account) {
+                Some(session) => Some(session),
+                None => {
+                    self.result(Err(anyhow::anyhow!("Войдите в выбранный аккаунт Ely.by заново.")), "");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         self.horizon_running = true;
-        self.result(Ok(()), "Запуск Minecraft 26.3 через Horizon…");
+        self.result(Ok(()), "Запуск клиента Horizon…");
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let result = (|| -> anyhow::Result<()> {
-                let log = std::fs::File::create(&log_path)?;
-                if !account.is_empty() {
-                    let status = std::process::Command::new(&launcher)
-                        .args(["account", "select", &account])
-                        .stdin(std::process::Stdio::null())
-                        .stdout(log.try_clone()?)
-                        .stderr(log.try_clone()?)
-                        .status()?;
-                    anyhow::ensure!(status.success(), "Аккаунт не найден в Semgas Horizon. Войдите в Ely.by через форк. Журнал: {}", log_path.display());
-                }
-                let mut command = std::process::Command::new(&launcher);
-                command.arg("play");
-                if !instance.is_empty() {
-                    command.arg("--instance").arg(instance);
-                }
-                let status = command
-                    .current_dir(launcher.parent().expect("absolute executable path"))
-                    .stdin(std::process::Stdio::null())
-                    .stdout(log.try_clone()?)
-                    .stderr(log)
-                    .status()?;
-                anyhow::ensure!(
-                    status.success(),
-                    "Horizon завершился с кодом {}. Журнал: {}",
-                    status
-                        .code()
-                        .map_or_else(|| "?".into(), |code| code.to_string()),
-                    log_path.display()
-                );
-                Ok(())
-            })();
+            let result = horizon::launch(&settings, &root, player, ely, &|status| {
+                let _ = tx.send(Event::HorizonProgress(status));
+                ctx.request_repaint();
+            });
             let _ = tx.send(Event::HorizonFinished(result));
+            ctx.request_repaint();
+        });
+    }
+    fn install_horizon(&mut self, ctx: &egui::Context) {
+        if self.horizon_running || self.busy {
+            return;
+        }
+        self.horizon_running = true;
+        self.result(Ok(()), "Подготовка установки Horizon…");
+        let (root, tx, ctx) = (self.root.clone(), self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let result = horizon::install(&root, &|status| {
+                let _ = tx.send(Event::HorizonProgress(status));
+                ctx.request_repaint();
+            }).map(|_| ());
+            let _ = tx.send(Event::HorizonInstalled(result));
             ctx.request_repaint();
         });
     }
@@ -1110,13 +1109,14 @@ impl Launcher {
             ctx.request_repaint();
         });
     }
-    fn store_account(&mut self, account: auth::Account, select: bool) {
+    fn store_account(&mut self, mut account: auth::Account, select: bool) {
         if let Some(i) = self
             .config
             .accounts
             .iter()
             .position(|a| a.uuid == account.uuid && a.kind == account.kind)
         {
+            account.local_skin = self.config.accounts[i].local_skin.take();
             self.config.accounts[i] = account;
             if select {
                 self.config.selected_account = i;
@@ -1458,6 +1458,11 @@ impl Launcher {
                     self.horizon_running = false;
                     self.result(result, "Horizon завершил работу.");
                 }
+                Event::HorizonProgress(status) => self.result(Ok(()), &status),
+                Event::HorizonInstalled(result) => {
+                    self.horizon_running = false;
+                    self.result(result, "Horizon установлен. Можно запускать игру.");
+                }
                 Event::ModsIdentified(result) => {
                     self.busy = false;
                     match result {
@@ -1554,73 +1559,57 @@ impl Launcher {
             .accounts
             .get(self.config.selected_account)
             .map(|account| (account.kind, account.ely_skins, account.name.clone()));
-        if was_horizon {
-            ui.horizontal(|ui| {
+        ui.horizontal(|ui| {
+            let response = if let Some(texture) = self
+                .config
+                .accounts
+                .get(self.config.selected_account)
+                .and_then(|a| self.avatars.get(a))
+            {
+                ui.add(egui::ImageButton::new(
+                    egui::Image::new(texture).fit_to_exact_size(Vec2::splat(24.)),
+                ))
+                .on_hover_text("Аккаунты")
+            } else {
+                icon_button(ui, Icon::User, "Аккаунты")
+            };
+            if response.clicked() {
+                self.toggle_page(Page::Accounts);
+            }
+            if let Some((kind, ely_skins, _)) = &account {
                 if self.config.appearance.show_account_icons {
-                    ui::account_icons(ui, auth::AccountKind::Microsoft, false);
+                    ui::account_icons(ui, *kind, *ely_skins);
                 }
-                if ui
-                    .button("Аккаунт из Horizon")
-                    .on_hover_text("Вход выполняется в Horizon Launcher")
-                    .clicked()
-                {
-                    self.settings_tab = SettingsTab::Game;
-                    self.navigate(Page::Settings);
-                }
-            });
-        } else {
-            ui.horizontal(|ui| {
-                let response = if let Some(texture) = self
-                    .config
-                    .accounts
-                    .get(self.config.selected_account)
-                    .and_then(|a| self.avatars.get(a))
-                {
-                    ui.add(egui::ImageButton::new(
-                        egui::Image::new(texture).fit_to_exact_size(Vec2::splat(24.)),
-                    ))
-                    .on_hover_text("Аккаунты")
-                } else {
-                    icon_button(ui, Icon::User, "Аккаунты")
-                };
-                if response.clicked() {
-                    self.toggle_page(Page::Accounts);
-                }
-                if let Some((kind, ely_skins, _)) = &account {
-                    if self.config.appearance.show_account_icons {
-                        ui::account_icons(ui, *kind, *ely_skins);
+            }
+            egui::ComboBox::from_id_salt("account")
+                .width(ui.available_width())
+                .truncate()
+                .selected_text(
+                    account
+                        .as_ref()
+                        .map_or("Добавить аккаунт", |(_, _, name)| {
+                            name.as_str()
+                        }),
+                )
+                .show_animated(ui, |ui| {
+                    let old = self.config.selected_account;
+                    for (i, a) in self.config.accounts.iter().enumerate() {
+                        if ui
+                            .selectable_label(self.config.selected_account == i, &a.name)
+                            .clicked()
+                        {
+                            self.config.selected_account = i;
+                            ui.close_menu();
+                        }
                     }
-                }
-                egui::ComboBox::from_id_salt("account")
-                    .width(ui.available_width())
-                    .truncate()
-                    .selected_text(
-                        account
-                            .as_ref()
-                            .map_or("Добавить аккаунт", |(_, _, name)| {
-                                name.as_str()
-                            }),
-                    )
-                    .show_animated(ui, |ui| {
-                        let old = self.config.selected_account;
-                        for (i, a) in self.config.accounts.iter().enumerate() {
-                            if ui
-                                .selectable_label(self.config.selected_account == i, &a.name)
-                                .clicked()
-                            {
-                                self.config.selected_account = i;
-                                ui.close_menu();
-                            }
-                        }
-                        if old != self.config.selected_account {
-                            self.save();
-                        }
-                        if ui.button("+ Добавить аккаунт").clicked() {
-                            self.navigate(Page::Accounts);
-                        }
-                    });
-            });
-        }
+                    if old != self.config.selected_account {
+                        self.save();
+                    }
+                    if ui.button("+ Добавить аккаунт").clicked() {
+                        self.navigate(Page::Accounts);
+                    }
+                });
+        });
         let old = self.config.selected;
         ui.add_enabled_ui(
             !self.busy
@@ -1638,7 +1627,7 @@ impl Launcher {
                 let has_icon =
                     self.config.appearance.show_build_icons && icon != model::BuildIcon::None;
                 let name = if was_horizon {
-                    "Minecraft 26.3 · Horizon (Rust)"
+                    "Minecraft · Horizon (Rust)"
                 } else {
                     &profile.name
                 };
@@ -1673,13 +1662,18 @@ impl Launcher {
                             });
                         }
                         ui.separator();
-                        if ui
-                            .selectable_label(was_horizon, "Minecraft 26.3 · Horizon (Rust)")
-                            .clicked()
-                        {
-                            self.config.horizon.selected = true;
-                            ui.close_menu();
-                        }
+                        ui.horizontal(|ui| {
+                            if self.config.appearance.show_build_icons {
+                                ui::build_thumbnail(ui, model::BuildIcon::Block, &instance, icon_size);
+                            }
+                            if ui
+                                .selectable_label(was_horizon, "Minecraft · Horizon (Rust)")
+                                .clicked()
+                            {
+                                self.config.horizon.selected = true;
+                                ui.close_menu();
+                            }
+                        });
                         if ui.button("Все версии…").clicked() {
                             self.navigate(Page::Versions);
                             ui.close_menu();
@@ -1714,13 +1708,9 @@ impl Launcher {
                     ui.add_sized(
                         [ui.available_width(), 48.],
                         egui::Button::new(
-                            RichText::new(if self.config.horizon.selected {
-                                if self.horizon_running {
-                                    "Horizon запущен"
-                                } else {
-                                    "Запустить Horizon"
-                                }
-                            } else if self.game_cancel.is_some()
+                            RichText::new(if self.config.horizon.selected && self.horizon_running {
+                                "Horizon запущен"
+                            } else if !self.config.horizon.selected && self.game_cancel.is_some()
                                 && !self.config.multi_session.enabled
                             {
                                 if self.game_running {
@@ -1832,6 +1822,37 @@ impl Launcher {
         }
         ui.separator();
         if self.account_kind.is_none() {
+            let mut changed = false;
+            if let Some(account) = self.config.accounts.get_mut(self.config.selected_account)
+                .filter(|account| account.kind == auth::AccountKind::Offline)
+            {
+                changed |= ui.checkbox(&mut account.ely_skins, "Использовать скин Ely.by по нику").changed();
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Выбрать PNG-скин для Horizon…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().add_filter("PNG", &["png"]).pick_file() {
+                            match skins::import(&self.root, &path) {
+                                Ok(skin) => {
+                                    account.local_skin = Some(skin);
+                                    self.auth_status.clear();
+                                    changed = true;
+                                }
+                                Err(error) => self.auth_status = format!("{error:#}"),
+                            }
+                        }
+                    }
+                    if let Some(skin) = account.local_skin.as_mut() {
+                        changed |= ui.checkbox(&mut skin.slim, "Тонкие руки").changed();
+                        if ui.small_button("Сбросить скин").clicked() {
+                            account.local_skin = None;
+                            changed = true;
+                        }
+                    }
+                });
+                ui.separator();
+            }
+            if changed {
+                self.save();
+            }
             if ui::provider_button(ui, Icon::Ely, "Ely.by (система скинов)").clicked()
             {
                 self.account_kind = Some(auth::AccountKind::ElyBy);
@@ -1864,7 +1885,7 @@ impl Launcher {
                         egui::TextEdit::singleline(&mut self.account_name).hint_text("Ваш ник"),
                     );
                     ui.checkbox(&mut self.offline_skins, "Использовать скины Ely.by")
-                        .on_hover_text("Скины внутри игры ещё не подключены");
+                        .on_hover_text("Выбирает скин по нику для Horizon и аватара");
                     if ui
                         .add_enabled(!self.auth_busy, egui::Button::new("Добавить"))
                         .clicked()
@@ -2110,48 +2131,38 @@ impl Launcher {
     }
 
     fn game_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        egui::CollapsingHeader::new("Minecraft 26.3 · Horizon (Rust)")
-            .default_open(
-                self.config.horizon.selected && self.config.horizon.launcher.as_os_str().is_empty(),
-            )
+        egui::CollapsingHeader::new("Minecraft · Horizon (Rust)")
+            .default_open(self.config.horizon.selected)
             .show(ui, |ui| {
-                ui.label(
-                    "Укажите лаунчер Semgas Horizon и войдите в аккаунт Ely.by в его настройках.",
-                );
-                ui.hyperlink_to(
-                    "Сборки Semgas Horizon для Windows и Linux",
-                    "https://gitlab.com/notehghewhd/semgas-horizon/-/releases",
-                );
-                let path = &mut self.config.horizon.launcher;
-                ui.add(egui::Label::new(path.display().to_string()).truncate());
-                let mut save = false;
-                if ui.button("Выбрать лаунчер Horizon…").clicked() {
-                    let dialog = rfd::FileDialog::new();
-                    #[cfg(windows)]
-                    let dialog = dialog.add_filter("Приложение", &["exe"]);
-                    if let Some(selected) = dialog.pick_file() {
-                        if selected.is_absolute() && selected.is_file() {
-                            *path = selected;
-                            save = true;
-                        } else {
-                            self.result(
-                                Err(anyhow::anyhow!("Выберите исполняемый файл Horizon.")),
-                                "",
-                            );
+                let mut changed = false;
+                if horizon::supports_install() {
+                    if ui.add_enabled(
+                        !self.horizon_running && !self.busy,
+                        egui::Button::new("Установить или обновить Horizon"),
+                    ).clicked() {
+                        self.install_horizon(ctx);
+                    }
+                    changed |= ui.checkbox(&mut self.config.horizon.auto_update, "Проверять обновления перед запуском").changed();
+                    changed |= ui.checkbox(&mut self.config.horizon.use_ely_session, "Вход на серверы через аккаунт Ely.by").changed();
+                }
+                let path = &mut self.config.horizon.game_home;
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Миры и настройки");
+                    if ui.button("Выбрать папку игры…").clicked() {
+                        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                            *path = folder;
+                            changed = true;
                         }
                     }
+                    if !path.as_os_str().is_empty() && ui.small_button("По умолчанию").clicked() {
+                        path.clear();
+                        changed = true;
+                    }
+                });
+                if !path.as_os_str().is_empty() {
+                    ui.add(egui::Label::new(path.display().to_string()).wrap());
                 }
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.config.horizon.instance)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("Профиль Horizon (пусто — активный)"),
-                );
-                let account = ui.add(
-                    egui::TextEdit::singleline(&mut self.config.horizon.account)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("Имя Ely.by в Horizon (пусто — активный)"),
-                );
-                if save || response.changed() || account.changed() {
+                if changed {
                     self.save();
                 }
             });
@@ -3433,7 +3444,50 @@ impl Launcher {
         }
     }
 
+    fn horizon_mods(&mut self, ui: &mut egui::Ui) -> anyhow::Result<()> {
+        let home = horizon::game_home(&self.config.horizon, &self.root)?;
+        ui.horizontal_wrapped(|ui| {
+            if ui.add_enabled(!self.horizon_running, egui::Button::new("Добавить .hmod…")).clicked() {
+                if let Some(path) = rfd::FileDialog::new().add_filter("Моды Horizon", &["hmod"]).pick_file() {
+                    let result = horizon_mods::install(&home, &path);
+                    self.result(result, "Мод Horizon установлен.");
+                }
+            }
+            if ui.button("Открыть папку модов").clicked() {
+                let folder = home.join("horizon-mods");
+                let result = std::fs::create_dir_all(&folder)
+                    .and_then(|()| open::that(folder)).map_err(Into::into);
+                self.result(result, "");
+            }
+            ui.hyperlink_to("Каталог Horizon", "https://playhorizon.dev/mods");
+        });
+        let mods = horizon_mods::installed(&home)?;
+        let options = horizon_mods::options(&home)?;
+        if mods.is_empty() {
+            ui.label("Моды Horizon пока не установлены.");
+        }
+        egui::ScrollArea::vertical().id_salt("horizon-mods").show(ui, |ui| {
+            for (id, entry) in mods {
+                let mut enabled = horizon_mods::enabled(&options, &id);
+                let name = if entry.name.is_empty() { &id } else { &entry.name };
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add_enabled(!self.horizon_running, egui::Checkbox::new(&mut enabled, name)).changed() {
+                        self.result(horizon_mods::set_enabled(&home, &id, enabled), "");
+                    }
+                    ui.weak(entry.version);
+                });
+            }
+        });
+        Ok(())
+    }
+
     fn mods(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.config.horizon.selected {
+            if let Err(error) = self.horizon_mods(ui) {
+                ui.label(format!("{error:#}"));
+            }
+            return;
+        }
         if !variant::LITE && self.config.curseforge_manual {
             ui.collapsing("CurseForge · ручная загрузка",|ui|{
                 ui.label("Скачайте мод на официальном сайте через свой браузер, затем импортируйте JAR. Версию Minecraft, загрузчик и зависимости проверяет пользователь. Потребуется перезапуск игры.");

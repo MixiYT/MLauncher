@@ -19,6 +19,8 @@ pub struct Account {
     pub uuid: String,
     pub kind: AccountKind,
     pub ely_skins: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_skin: Option<crate::skins::LocalSkin>,
     #[serde(skip)]
     pub session: Option<Session>,
 }
@@ -59,6 +61,7 @@ impl Account {
             uuid: uuid::Uuid::from_bytes(bytes).simple().to_string(),
             kind: AccountKind::Offline,
             ely_skins: skins,
+            local_skin: None,
             session: None,
         })
     }
@@ -151,6 +154,7 @@ pub fn authenticate(
         uuid: id,
         kind: AccountKind::ElyBy,
         ely_skins: true,
+        local_skin: None,
         session: Some(Session::new(Zeroizing::new(token), client_token)),
     })
 }
